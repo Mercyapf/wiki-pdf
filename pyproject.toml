@@ -1,7 +1,7 @@
 [project]
 name = "wiki_pdf"
 authors = [
-    { name = "User", email = "user@example.com"}
+    { name = "Mercy Selvanayagi", email = "mercy.selvanayagi@azimpremjifoundation.org"}
 ]
 description = "Custom App for Wiki PDF Download"
 requires-python = ">=3.10"
