@@ -22,7 +22,7 @@ function add_download_pdf_button() {
 
     // Construct the download URL pointing to our custom app's method
     // Note: We use 'route' parameter now, which we will support in the python method
-    var download_url = "/api/method/wiki_pdf.wiki_pdf.pdf.download_wiki_pdf?route=" + encodeURIComponent(current_route);
+    var download_url = "/api/method/wiki_pdf.pdf.download_wiki_pdf?route=" + encodeURIComponent(current_route);
 
     var $btn = $('<a>')
         .attr('id', 'btn-download-wiki-pdf')
