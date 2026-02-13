@@ -1,2 +1,2 @@
-wiki_pdf.pdf
-wiki_pdf.www.download-wiki-pdf
+pdf
+www.download-wiki-pdf
