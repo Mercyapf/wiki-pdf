@@ -12,6 +12,10 @@ def download_wiki_pdf(page_name=None, route=None):
 		frappe.throw(_("Page Name or Route is required"))
 	
 	if not page_name and route:
+		# Strip trailing slash from route
+		if route.endswith("/"):
+			route = route[:-1]
+
 		# Lookup page name from route
 		page_name = frappe.db.get_value("Wiki Page", {"route": route}, "name")
 		if not page_name:
@@ -123,11 +127,44 @@ def download_wiki_pdf(page_name=None, route=None):
 	# Remove video tags and replace with link
 	html = re.sub(r'<video[^>]*>.*?</video>', replace_video, html, flags=re.DOTALL | re.IGNORECASE)
 
-	# Expand details/summary for PDF so content like "Foundation Vision" is visible
+	# Expand details, summary, and print styles...
 	html = re.sub(r'<details[^>]*>', '<div class="pdf-details" style="display: block; margin: 10px 0; font-family: \'Times New Roman\', serif;">', html, flags=re.IGNORECASE)
 	html = re.sub(r'</details>', '</div>', html, flags=re.IGNORECASE)
 	html = re.sub(r'<summary[^>]*>', '<div class="pdf-summary" style="font-weight: bold; margin-bottom: 5px; font-family: \'Times New Roman\', serif;">', html, flags=re.IGNORECASE)
 	html = re.sub(r'</summary>', '</div>', html, flags=re.IGNORECASE)
+
+	# -------------------------------------------------
+	# INJECT COVERS
+	# -------------------------------------------------
+	# Cover Page
+	# Use Space Title or Page Title
+	cover_title = page_doc.title
+	if wiki_group_item and frappe.db.exists("Wiki Space", wiki_group_item.parent):
+		space_for_title = frappe.get_doc("Wiki Space", wiki_group_item.parent)
+		if space_for_title.space_name:
+			cover_title = space_for_title.space_name
+
+	cover_html = f"""
+	<div class="pdf-cover" style="text-align: center; page-break-after: always; display: flex; flex-direction: column; justify-content: center; height: 100vh;">
+		<h1 style="font-size: 48pt; margin-top: 40%; font-family: 'Times New Roman', serif;">{cover_title}</h1>
+	</div>
+	"""
+	
+	# Back Cover Page
+	back_cover_image_path = frappe.get_app_path("wiki_pdf", "public", "images", "back_cover.jpg")
+	if os.path.exists(back_cover_image_path):
+		back_cover_html = f"""
+		<div class="pdf-back-cover" style="page-break-before: always; width: 100%; height: 100vh; background-image: url('file://{back_cover_image_path}'); background-size: cover; background-position: center;">
+		</div>
+		"""
+	else:
+		back_cover_html = ""
+
+	# Inject into HTML
+	# Insert Cover after body start
+	html = re.sub(r'(<body[^>]*>)', lambda m: m.group(0) + cover_html, html, count=1, flags=re.IGNORECASE)
+	# Insert Back Cover before body end
+	html = re.sub(r'(</body>)', lambda m: back_cover_html + m.group(0), html, count=1, flags=re.IGNORECASE)
 
 	# Inject print styles globally to ensure content visibility and proper layout
 	# We remove @media print to force these styles regardless of how the PDF generator interprets the view
@@ -151,22 +188,22 @@ def download_wiki_pdf(page_name=None, route=None):
 				margin: 0;
 				padding: 0;
 			}
-
-			/* Explicitly hide the page title from show.html template and other UI */
-			.admin-banner, .sidebar-column, .page-toc, .wiki-footer, .wiki-page-meta, .navbar, .page-head, .modal, .wiki-editor { 
-				display: none !important; 
-			}
 			
-			/* Reset all elements related to layout */
+			/* Adjust wiki-content to not double up margins if they are set elsewhere */
 			.wiki-content,
 			.wiki-page-content,
 			.content-view {
 				margin: 0 !important;
-				padding: 5mm !important;
+				padding: 0 !important; /* Managed by @page */
 				width: 100% !important;
 				max-width: 100% !important;
 				font-family: "Times New Roman", Times, serif !important;
 				font-size: 14pt !important;
+			}
+
+			/* Explicitly hide the page title from show.html template and other UI */
+			.admin-banner, .sidebar-column, .page-toc, .wiki-footer, .wiki-page-meta, .navbar, .page-head, .modal, .wiki-editor { 
+				display: none !important; 
 			}
 			
 			p, li, div {
@@ -298,9 +335,15 @@ def download_wiki_pdf(page_name=None, route=None):
 	# Use Space Name if available, else Page Title
 	if wiki_group_item and frappe.db.exists("Wiki Space", wiki_group_item.parent):
 		space = frappe.get_doc("Wiki Space", wiki_group_item.parent)
-		filename = f"{space.space_name}.pdf"
+		filename = space.space_name or space.route
+		if not filename:
+			filename = page_doc.title
 	else:
-		filename = f"{page_doc.title}.pdf"
+		filename = page_doc.title
+
+	# Ensure filename ends with .pdf
+	if not str(filename).lower().endswith('.pdf'):
+		filename = f"{filename}.pdf"
 
 	try:
 		frappe.local.response.filecontent = get_pdf(html, options=options)
@@ -357,6 +400,30 @@ def download_full_wiki_space(wiki_space):
 	# -------------------------------------------------
 	# 4. Build ONE HTML for ALL pages
 	# -------------------------------------------------
+	# -------------------------------------------------
+	# 4. Build ONE HTML for ALL pages
+	# -------------------------------------------------
+	
+	# Prepare Cover Content
+	cover_html = f"""
+	<div class="pdf-cover" style="text-align: center; page-break-after: always; display: flex; flex-direction: column; justify-content: center; height: 100vh;">
+		<h1 style="font-size: 48pt; margin-top: 40%;">{root.title}</h1>
+	</div>
+	"""
+
+	# Prepare Back Cover Content
+	# We use local file path for image to ensure it loads
+	back_cover_image_path = frappe.get_app_path("wiki_pdf", "public", "images", "back_cover.jpg")
+	
+	if os.path.exists(back_cover_image_path):
+		back_cover_html = f"""
+		<div class="pdf-back-cover" style="page-break-before: always; width: 100%; height: 100vh; background-image: url('file://{back_cover_image_path}'); background-size: cover; background-position: center;">
+			<!-- Image background covers the page -->
+		</div>
+		"""
+	else:
+		back_cover_html = ""
+
 	html = """
 	<html>
 	<head>
@@ -365,22 +432,36 @@ def download_full_wiki_space(wiki_space):
 				font-family: "Times New Roman", Times, serif; 
 				font-size: 14pt;
 				line-height: 1.35;
+				margin: 0;
+				padding: 0;
 			}
 			h1 { 
-				page-break-before: always; 
 				font-weight: bold;
 			}
 			img { max-width: 100%; height: auto; }
+			
+			/* Ensure cover page has no header/footer if possible via CSS (difficult in wkhtmltopdf without JS) */
 		</style>
 	</head>
 	<body>
 	"""
 
+	# Add Cover
+	html += cover_html
+
 	for page in pages:
+		# Add page break before each new page title, except the very first one if it follows cover immediately (optional, but good practice)
+		page_break = "page-break-before: always;" 
+		
 		html += f"""
-		<h1>{page.title}</h1>
-		<div>{page.content}</div>
+		<div style="{page_break}">
+			<h1>{page.title}</h1>
+			<div>{page.content}</div>
+		</div>
 		"""
+
+	# Add Back Cover
+	html += back_cover_html
 
 	html += "</body></html>"
 
@@ -450,6 +531,20 @@ def download_full_wiki_space(wiki_space):
 	# -------------------------------------------------
 	# 7. Send PDF as download
 	# -------------------------------------------------
-	frappe.local.response.filename = f"{wiki_space}.pdf"
+	
+	# Fix Filename Logic
+	# Get space doc to check for title
+	space_doc = frappe.db.get_value("Wiki Space", {"route": wiki_space}, ["space_name"], as_dict=True)
+	
+	if space_doc:
+		filename = space_doc.space_name or wiki_space
+	else:
+		filename = root.title or wiki_space
+		
+	# Ensure pdf extension
+	if not filename.lower().endswith(".pdf"):
+		filename += ".pdf"
+		
+	frappe.local.response.filename = filename
 	frappe.local.response.filecontent = pdf
 	frappe.local.response.type = "download"

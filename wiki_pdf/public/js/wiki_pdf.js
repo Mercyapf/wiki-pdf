@@ -7,7 +7,22 @@ frappe.ready(function () {
 });
 
 function add_download_pdf_button() {
-    if ($('#btn-download-wiki-pdf').length > 0) {
+    var $btn = $('#btn-download-wiki-pdf');
+
+    // Get the current route
+    var current_route = window.location.pathname.replace(/^\//, '');
+
+    // Strip trailing slash if present
+    if (current_route.endsWith('/')) {
+        current_route = current_route.slice(0, -1);
+    }
+
+    // Construct the download URL
+    var download_url = "/api/method/wiki_pdf.pdf.download_wiki_pdf?route=" + encodeURIComponent(current_route);
+
+    if ($btn.length > 0) {
+        // If button exists, just update the href (in case of SPA navigation)
+        $btn.attr('href', download_url);
         return;
     }
 
@@ -17,14 +32,7 @@ function add_download_pdf_button() {
 
     if ($navbar.length === 0) return;
 
-    // Get the current route
-    var current_route = window.location.pathname.replace(/^\//, '');
-
-    // Construct the download URL pointing to our custom app's method
-    // Note: We use 'route' parameter now, which we will support in the python method
-    var download_url = "/api/method/wiki_pdf.pdf.download_wiki_pdf?route=" + encodeURIComponent(current_route);
-
-    var $btn = $('<a>')
+    $btn = $('<a>')
         .attr('id', 'btn-download-wiki-pdf')
         .attr('href', download_url)
         .addClass('navbar-link mr-2 d-print-none')
