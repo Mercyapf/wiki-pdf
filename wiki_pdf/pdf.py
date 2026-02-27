@@ -162,17 +162,17 @@ PDF_CSS = """
 
 html, body {
     margin: 0; padding: 0;
-    font-family: "Times New Roman", Times, serif;
-    font-size: 13pt;
+    font-family: Georgia, serif;
+    font-size: 12pt;
     line-height: 1.5;
     color: #111;
 }
 
 /* ── Group heading (Introduction / HR Structure) ── */
 h1.group-name {
-    font-size: 22pt;
+    font-size: 20pt;
     font-weight: bold;
-    font-family: "Times New Roman", Times, serif;
+    font-family: Georgia, serif;
     border-bottom: 2px solid #333;
     padding-bottom: 4pt;
     margin: 0 0 14pt 0;
@@ -182,9 +182,9 @@ h1.group-name {
 
 /* ── Page title ── */
 h1.page-title {
-    font-size: 19pt;
+    font-size: 16pt;
     font-weight: bold;
-    font-family: "Times New Roman", Times, serif;
+    font-family: Georgia, serif;
     margin: 0 0 12pt 0;
     color: #1a52a0;
     page-break-after: avoid;
@@ -314,7 +314,7 @@ function subst() {
 </script>
 </head>
 <body style="border:0;margin:0;" onload="subst()">
-<div style="font-family:'Times New Roman',Times,serif;font-size:10pt;text-align:center;width:100%;">
+<div style="font-family:Georgia,serif;font-size:10pt;text-align:center;width:100%;">
     <span class="page"></span>
 </div>
 </body>
