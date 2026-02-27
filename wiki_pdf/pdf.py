@@ -1,550 +1,595 @@
 import frappe
 from frappe.utils.pdf import get_pdf
-from frappe.utils import cint
 from frappe import _
 import tempfile
 import os
 import re
+import markdown2
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Markdown → HTML
+# ─────────────────────────────────────────────────────────────────────────────
+
+_MD_EXTRAS = [
+    "tables",
+    "fenced-code-blocks",
+    "strike",
+    "cuddled-lists",
+    "break-on-newline",
+    "header-ids",
+    "footnotes",
+]
+
+
+def _md_to_html(text):
+    """Convert markdown text to HTML using markdown2."""
+    if not text:
+        return ""
+    return markdown2.markdown(text, extras=_MD_EXTRAS)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Post-process: replace iframes / videos / details for PDF
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _split_tables(html, max_rows=15):
+    """
+    Split large tables into groups of `max_rows` body rows.
+    Each group becomes its own <table> with the original <thead> repeated
+    and `page-break-inside:avoid` at the TABLE level.
+
+    Why this works:
+      - wkhtmltopdf does NOT honour page-break-inside:avoid on <tr> or <td>
+        (regardless of inline vs stylesheet).
+      - wkhtmltopdf DOES honour page-break-inside:avoid on a <table> element.
+      - So we split large tables into small sub-tables; each sub-table fits
+        on one page and stays whole.
+    """
+
+    def _get_thead(table_html):
+        m = re.search(r'(<thead[^>]*>.*?</thead>)', table_html, re.DOTALL | re.IGNORECASE)
+        if m:
+            return m.group(1)
+        # No <thead>: treat the first <tr> as the header
+        first = re.search(r'(<tr[^>]*>.*?</tr>)', table_html, re.DOTALL | re.IGNORECASE)
+        if first:
+            return f'<thead>{first.group(1)}</thead>'
+        return ''
+
+    def _get_colgroup(table_html):
+        m = re.search(r'(<colgroup[^>]*>.*?</colgroup>)', table_html, re.DOTALL | re.IGNORECASE)
+        return m.group(1) if m else ''
+
+    def _get_tbody_rows(table_html):
+        tbody = re.search(r'<tbody[^>]*>(.*?)</tbody>', table_html, re.DOTALL | re.IGNORECASE)
+        src = tbody.group(1) if tbody else table_html
+        return re.findall(r'<tr[^>]*>.*?</tr>', src, re.DOTALL | re.IGNORECASE)
+
+    def _get_table_open_attrs(table_html):
+        m = re.match(r'<table([^>]*)>', table_html, re.IGNORECASE)
+        return m.group(1) if m else ''
+
+    TABLE_STYLE = (
+        'width:100%;border-collapse:collapse;table-layout:fixed;font-size:10pt;'
+        'margin:0 0 0 0;page-break-inside:avoid;break-inside:avoid;'
+    )
+
+    def process_table(match):
+        table_html = match.group(0)
+        thead = _get_thead(table_html)
+        colgroup = _get_colgroup(table_html)
+        rows = _get_tbody_rows(table_html)
+
+        if len(rows) <= max_rows:
+            # Small table: just stamp page-break-inside:avoid on the table tag
+            fixed = re.sub(
+                r'<table([^>]*)>',
+                lambda m: f'<table{m.group(1)} style="{TABLE_STYLE}">',
+                table_html, count=1, flags=re.IGNORECASE
+            )
+            return fixed
+
+        # Large table: split into sub-tables of max_rows
+        chunks = [rows[i:i + max_rows] for i in range(0, len(rows), max_rows)]
+        parts = []
+        for idx, chunk in enumerate(chunks):
+            # Add "Continued..." label for continuation chunks (2nd onwards)
+            continued = (
+                '<div style="font-size:9pt;color:#555;text-align:right;margin-top:4pt;">'
+                '(continued from previous page)</div>' if idx > 0 else ''
+            )
+            tbody_html = '\n'.join(chunk)
+            sub_table = (
+                f'{continued}'
+                f'<table style="{TABLE_STYLE}">'
+                f'{colgroup}'
+                f'{thead}'
+                f'<tbody>{tbody_html}</tbody>'
+                f'</table>'
+            )
+            parts.append(sub_table)
+
+        # Separate sub-tables with a tiny gap so they don't visually merge
+        return '\n<div style="margin:4pt 0;"></div>\n'.join(parts)
+
+    html = re.sub(r'<table[^>]*>.*?</table>', process_table, html, flags=re.DOTALL | re.IGNORECASE)
+    return html
+
+
+def _clean_for_pdf(html):
+    def replace_iframe(match):
+        src = re.search(r'src=["\']([^"\']+)["\']', match.group(0))
+        if src:
+            url = src.group(1)
+            if "youtube.com/embed/" in url:
+                video_id = url.split("embed/")[1].split("?")[0]
+                url = f"https://www.youtube.com/watch?v={video_id}"
+            return f'<div class="pdf-video-link"><a href="{url}">Watch Video: {url}</a></div>'
+        return match.group(0)
+
+    def replace_video(match):
+        src = re.search(r'src=["\']([^"\']+)["\']', match.group(0))
+        if src:
+            url = src.group(1)
+            return f'<div class="pdf-video-link"><a href="{url}">Watch Video: {url}</a></div>'
+        return "<!-- video removed -->"
+
+    html = re.sub(r'<iframe[^>]*>.*?</iframe>', replace_iframe, html, flags=re.DOTALL | re.IGNORECASE)
+    html = re.sub(r'<video[^>]*>.*?</video>', replace_video, html, flags=re.DOTALL | re.IGNORECASE)
+    html = re.sub(r'<details[^>]*>', '<div class="pdf-details">', html, flags=re.IGNORECASE)
+    html = re.sub(r'</details>', '</div>', html, flags=re.IGNORECASE)
+    html = re.sub(r'<summary[^>]*>', '<span class="pdf-summary">', html, flags=re.IGNORECASE)
+    html = re.sub(r'</summary>', '</span><br>', html, flags=re.IGNORECASE)
+
+    # Split large tables → multiple sub-tables so page-break-inside:avoid works
+    html = _split_tables(html)
+    return html
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CSS
+# ─────────────────────────────────────────────────────────────────────────────
+
+PDF_CSS = """
+@page {
+    size: A4;
+    margin-top: 15mm;
+    margin-bottom: 18mm;
+    margin-left: 18mm;
+    margin-right: 18mm;
+}
+
+html, body {
+    margin: 0; padding: 0;
+    font-family: "Times New Roman", Times, serif;
+    font-size: 13pt;
+    line-height: 1.5;
+    color: #111;
+}
+
+/* ── Group heading (Introduction / HR Structure) ── */
+h1.group-name {
+    font-size: 22pt;
+    font-weight: bold;
+    font-family: "Times New Roman", Times, serif;
+    border-bottom: 2px solid #333;
+    padding-bottom: 4pt;
+    margin: 0 0 14pt 0;
+    color: #111;
+    page-break-after: avoid;
+}
+
+/* ── Page title ── */
+h1.page-title {
+    font-size: 19pt;
+    font-weight: bold;
+    font-family: "Times New Roman", Times, serif;
+    margin: 0 0 12pt 0;
+    color: #1a52a0;
+    page-break-after: avoid;
+}
+
+/* ── Content headings (from markdown # ## ### etc.) ── */
+h1 { font-size: 17pt; font-weight: bold; margin: 12pt 0 6pt 0; color: #111; page-break-after: avoid; }
+h2 { font-size: 16pt; font-weight: bold; margin: 10pt 0 5pt 0; color: #111; page-break-after: avoid; }
+h3 { font-size: 15pt; font-weight: bold; margin:  8pt 0 4pt 0; color: #111; page-break-after: avoid; }
+h4 { font-size: 14pt; font-weight: bold; margin:  6pt 0 3pt 0; color: #111; page-break-after: avoid; }
+h5, h6 { font-size: 13pt; font-weight: bold; margin: 5pt 0 2pt 0; color: #111; }
+
+p   { margin: 4pt 0; }
+li  { margin-bottom: 2pt; }
+ul, ol { padding-left: 18pt; margin: 4pt 0; }
+
+b, strong { font-weight: bold; }
+em, i     { font-style: italic; }
+s, del    { text-decoration: line-through; }
+
+a { color: #1a6fa8; text-decoration: underline; }
+
+img { max-width: 100%; height: auto; }
+
+hr { border: 0; border-top: 1px solid #bbb; margin: 10pt 0; }
+
+code {
+    font-family: "Courier New", monospace;
+    font-size: 11pt;
+    background: #f4f4f4;
+    padding: 1pt 3pt;
+}
+
+pre {
+    font-family: "Courier New", monospace;
+    font-size: 10pt;
+    background: #f4f4f4;
+    border: 1px solid #ddd;
+    padding: 8pt;
+    margin: 6pt 0;
+    white-space: pre-wrap;
+    word-wrap: break-word;
+    page-break-inside: avoid;
+}
+
+/* ── Blockquote → full box (callout card style) ── */
+blockquote {
+    border: 1px solid #bbb;
+    border-left: 4pt solid #555;
+    border-radius: 3pt;
+    background: #f7f7f7;
+    margin: 8pt 0;
+    padding: 8pt 14pt;
+    page-break-inside: avoid;
+}
+
+/* ── Tables ── */
+table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 8pt 0;
+    table-layout: fixed;        /* columns share width evenly → no overflow */
+    font-size: 10pt;            /* smaller font → shorter rows → cleaner breaks */
+}
+
+/* Repeat header on every page when table spans multiple pages */
+thead {
+    display: table-header-group;
+}
+
+th {
+    background-color: #eee;
+    font-weight: bold;
+    border: 1px solid #aaa;
+    padding: 2pt 5pt;
+    text-align: left;
+    vertical-align: top;
+    word-break: break-word;
+    overflow-wrap: break-word;
+    line-height: 1.2;
+}
+
+td {
+    border: 1px solid #aaa;
+    padding: 2pt 5pt;
+    vertical-align: top;
+    word-break: break-word;
+    overflow-wrap: break-word;
+    line-height: 1.2;
+}
+
+/* ── Video links ── */
+.pdf-video-link {
+    border: 1px solid #ccc;
+    background: #f9f9f9;
+    padding: 6pt 10pt;
+    margin: 6pt 0;
+    display: block;
+}
+
+.pdf-details { display: block; margin: 6pt 0; }
+.pdf-summary { font-weight: bold; }
+"""
+
+FOOTER_HTML = """<!DOCTYPE html>
+<html>
+<head>
+<script>
+function subst() {
+    var vars = {};
+    var qs = document.location.search.substring(1).split('&');
+    for (var i in qs) {
+        if (qs.hasOwnProperty(i)) {
+            var kv = qs[i].split('=', 2);
+            vars[kv[0]] = decodeURI(kv[1]);
+        }
+    }
+    var cls = ['page','frompage','topage','webpage','section','subsection',
+               'date','isodate','time','title','doctitle','sitepage','sitepages'];
+    for (var c in cls) {
+        if (cls.hasOwnProperty(c)) {
+            var els = document.getElementsByClassName(cls[c]);
+            for (var j = 0; j < els.length; ++j) { els[j].textContent = vars[cls[c]]; }
+        }
+    }
+}
+</script>
+</head>
+<body style="border:0;margin:0;" onload="subst()">
+<div style="font-family:'Times New Roman',Times,serif;font-size:10pt;text-align:center;width:100%;">
+    <span class="page"></span>
+</div>
+</body>
+</html>"""
+
+
+def _write_footer():
+    with tempfile.NamedTemporaryFile(suffix=".html", delete=False, mode="w", encoding="utf-8") as f:
+        f.write(FOOTER_HTML)
+        return f.name
+
+
+def _pdf_options(footer_path):
+    return {
+        "enable-local-file-access": "",
+        "disable-smart-shrinking": "",
+        "quiet": None,
+        "encoding": "UTF-8",
+        "page-size": "A4",
+        "margin-top": "15mm",
+        "margin-bottom": "18mm",
+        "margin-left": "18mm",
+        "margin-right": "18mm",
+        "footer-html": footer_path,
+        "footer-spacing": "5",
+    }
+
+
+def _wrap(body):
+    return f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<style>{PDF_CSS}</style>
+</head>
+<body>{body}</body>
+</html>"""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PRIMARY ENDPOINT – called by the Download PDF button
+# ─────────────────────────────────────────────────────────────────────────────
 
 @frappe.whitelist(allow_guest=True)
 def download_wiki_pdf(page_name=None, route=None):
-	if not page_name and not route:
-		frappe.throw(_("Page Name or Route is required"))
-	
-	if not page_name and route:
-		# Strip trailing slash from route
-		if route.endswith("/"):
-			route = route[:-1]
+    """
+    Download all pages of the Wiki Space that contains `page_name` as one PDF.
 
-		# Lookup page name from route
-		page_name = frappe.db.get_value("Wiki Page", {"route": route}, "name")
-		if not page_name:
-			frappe.throw(_("Wiki Page not found for route: {0}").format(route))
+    PDF structure:
+        Introduction              ← group heading (h1.group-name)
+          Home                    ← page title (h1.page-title)
+          [Content with headings rendered from markdown]
+          ---page break---
+          Design
+          [Content …]
+        ---page break---
+        HR Structure
+          Roles
+          [Content …]
 
-	page_doc = frappe.get_doc("Wiki Page", page_name)
-	page_doc.check_permission("read")
+    Tables are kept whole on a single page.
+    """
+    if not page_name and not route:
+        frappe.throw(_("Page Name or Route is required"))
 
-	# 1. Identify Wiki Space
-	# Wiki Pages are linked to a Space via "Wiki Group Item" (parent field)
-	# We need to find the root space or common parent.
-	# Based on wiki_page.py logic, `get_space_route` or `Wiki Group Item` usage.
-	
-	wiki_group_item = frappe.db.get_value("Wiki Group Item", {"wiki_page": page_name}, ["parent"], as_dict=True)
-	
-	if not wiki_group_item:
-		# Fallback if page is not in a group/space (orphan?) - just render single page
-		final_content = f"<h1>{page_doc.title}</h1>{page_doc.content}"
-	else:
-		space_name = wiki_group_item.parent
-		
-		# 2. Fetch all pages in this space
-		# We need to respect the sidebar order. 
-		# Wiki Group Items define the structure.
-		sidebar_items = frappe.get_all(
-			"Wiki Group Item",
-			filters={"parent": space_name},
-			fields=["wiki_page", "idx"],
-			order_by="idx asc"
-		)
-		
-		final_content = ""
-		# Bulk fetch all pages to avoid N+1 queries
-		page_names = [item.wiki_page for item in sidebar_items if item.wiki_page]
-		
-		# Fetch pages user has permission to read
-		pages_data = frappe.get_list(
-			"Wiki Page",
-			filters={"name": ["in", page_names]},
-			fields=["name", "title", "content"],
-			limit=len(page_names) + 10
-		)
-		
-		# Create a lookup map
-		pages_map = {row.name: row for row in pages_data}
-		
-		final_content = ""
-		for item in sidebar_items:
-			try:
-				if item.wiki_page not in pages_map:
-					continue
-					
-				p_data = pages_map[item.wiki_page]
-				
-				# Append Content - No forced page break, just a separator
-				final_content += f"\n\n<hr style='margin: 20px 0; border: 0; border-top: 1px solid #eee;'>\n\n" if final_content else ""
-				final_content += f"# {p_data.title}\n\n"
-				final_content += p_data.content or ""
-			except Exception:
-				continue
+    if not page_name and route:
+        if route.endswith("/"):
+            route = route[:-1]
+        page_name = frappe.db.get_value("Wiki Page", {"route": route}, "name")
+        if not page_name:
+            frappe.throw(_("Wiki Page not found for route: {0}").format(route))
 
-	# 3. Prepare Context
-	# We use the requested page_doc as the "host" for the template (styles, etc)
-	# But we override the content.
-	
-	context = frappe._dict(page_doc.as_dict())
-	context.doc = page_doc
-	page_doc.get_context(context)
-	
-	# OVERRIDE CONTENT
-	# The template show.html uses `content` variable.
-	context.content = final_content
+    page_doc = frappe.get_doc("Wiki Page", page_name)
+    page_doc.check_permission("read")
 
-	html = frappe.render_template(
-		"wiki/wiki/doctype/wiki_page/templates/wiki_page.html", context
-	)
+    # ── 1. Find the Wiki Space ────────────────────────────────────────────────
+    wiki_group_item = frappe.db.get_value(
+        "Wiki Group Item", {"wiki_page": page_name}, ["parent"], as_dict=True
+    )
 
-	# 4. Post-Render Modifications
-	# Apply regex replacements on the FINAL HTML to ensure we catch all iframes/videos/details generated from Markdown
-	
-	def replace_iframe(match):
-		src = re.search(r'src=["\'](.*?)["\']', match.group(0))
-		if src:
-			url = src.group(1)
-			# transform youtube embed to watch link
-			if "youtube.com/embed/" in url:
-				video_id = url.split("embed/")[1].split("?")[0]
-				url = f"https://www.youtube.com/watch?v={video_id}"
-				
-			# Light blue link #03a9f4 as requested
-			return f'<div class="pdf-video-link" style="margin: 10px 0;"><a href="{url}" style="color: #03a9f4; text-decoration: underline;">Watch Video: {url}</a></div>'
-		return match.group(0)
+    # ── 2. Build ordered group → pages structure ──────────────────────────────
+    groups = []   # [{"label": str, "pages": [{"title":, "content_html":}]}]
 
-	def replace_video(match):
-		# Try to find src in video tag or nested source tag
-		src = re.search(r'src=["\'](.*?)["\']', match.group(0))
-		if src:
-			url = src.group(1)
-			# transform youtube embed to watch link
-			if "youtube.com/embed/" in url:
-				video_id = url.split("embed/")[1].split("?")[0]
-				url = f"https://www.youtube.com/watch?v={video_id}"
-				
-			return f'<div class="pdf-video-link" style="margin: 10px 0;"><a href="{url}" style="color: #03a9f4; text-decoration: underline;">Watch Video: {url}</a></div>'
-		return "<!-- Video without src removed for PDF -->"
-	
-	# Remove iframes (youtube etc) and replace with link
-	html = re.sub(r'<iframe[^>]*>.*?</iframe>', replace_iframe, html, flags=re.DOTALL | re.IGNORECASE)
-	# Remove video tags and replace with link
-	html = re.sub(r'<video[^>]*>.*?</video>', replace_video, html, flags=re.DOTALL | re.IGNORECASE)
+    if not wiki_group_item:
+        content_html = _clean_for_pdf(_md_to_html(page_doc.content or ""))
+        groups.append({"label": None, "pages": [{"title": page_doc.title, "content_html": content_html}]})
+    else:
+        space_name = wiki_group_item.parent
 
-	# Expand details, summary, and print styles...
-	html = re.sub(r'<details[^>]*>', '<div class="pdf-details" style="display: block; margin: 10px 0; font-family: \'Times New Roman\', serif;">', html, flags=re.IGNORECASE)
-	html = re.sub(r'</details>', '</div>', html, flags=re.IGNORECASE)
-	html = re.sub(r'<summary[^>]*>', '<div class="pdf-summary" style="font-weight: bold; margin-bottom: 5px; font-family: \'Times New Roman\', serif;">', html, flags=re.IGNORECASE)
-	html = re.sub(r'</summary>', '</div>', html, flags=re.IGNORECASE)
+        sidebar_items = frappe.get_all(
+            "Wiki Group Item",
+            filters={"parent": space_name},
+            fields=["wiki_page", "parent_label", "idx"],
+            order_by="idx asc",
+        )
 
-	# -------------------------------------------------
-	# INJECT COVERS
-	# -------------------------------------------------
-	# Cover Page
-	# Use Space Title or Page Title
-	cover_title = page_doc.title
-	if wiki_group_item and frappe.db.exists("Wiki Space", wiki_group_item.parent):
-		space_for_title = frappe.get_doc("Wiki Space", wiki_group_item.parent)
-		if space_for_title.space_name:
-			cover_title = space_for_title.space_name
+        page_names = [item.wiki_page for item in sidebar_items if item.wiki_page]
+        pages_data = frappe.get_list(
+            "Wiki Page",
+            filters={"name": ["in", page_names]},
+            fields=["name", "title", "content"],
+            limit=len(page_names) + 10,
+        )
+        pages_map = {row.name: row for row in pages_data}
 
-	cover_html = f"""
-	<div class="pdf-cover" style="text-align: center; page-break-after: always; display: flex; flex-direction: column; justify-content: center; height: 100vh;">
-		<h1 style="font-size: 48pt; margin-top: 40%; font-family: 'Times New Roman', serif;">{cover_title}</h1>
-	</div>
-	"""
-	
-	# Back Cover Page
-	back_cover_image_path = frappe.get_app_path("wiki_pdf", "public", "images", "back_cover.jpg")
-	if os.path.exists(back_cover_image_path):
-		back_cover_html = f"""
-		<div class="pdf-back-cover" style="page-break-before: always; width: 100%; height: 100vh; background-image: url('file://{back_cover_image_path}'); background-size: cover; background-position: center;">
-		</div>
-		"""
-	else:
-		back_cover_html = ""
+        for item in sidebar_items:
+            if item.wiki_page not in pages_map:
+                continue
+            p = pages_map[item.wiki_page]
+            label = item.parent_label or ""
 
-	# Inject into HTML
-	# Insert Cover after body start
-	html = re.sub(r'(<body[^>]*>)', lambda m: m.group(0) + cover_html, html, count=1, flags=re.IGNORECASE)
-	# Insert Back Cover before body end
-	html = re.sub(r'(</body>)', lambda m: back_cover_html + m.group(0), html, count=1, flags=re.IGNORECASE)
+            if not groups or groups[-1]["label"] != label:
+                groups.append({"label": label, "pages": []})
 
-	# Inject print styles globally to ensure content visibility and proper layout
-	# We remove @media print to force these styles regardless of how the PDF generator interprets the view
-	html += """
-	<style>
-			@page {
-				size: A4;
-				margin-top: 10mm;
-				margin-bottom: 30mm; /* MUST be >= footer height */
-				margin-left: 10mm;
-				margin-right: 10mm;
-			}
-			
-			html, body {
-				width: 100%;
-				font-family: "Times New Roman", Times, serif !important;
-				line-height: 1.35 !important;
-				font-size: 14pt !important;
-				
-				/* ❌ DO NOT ZERO OUT MARGINS */
-				margin: 0;
-				padding: 0;
-			}
-			
-			/* Adjust wiki-content to not double up margins if they are set elsewhere */
-			.wiki-content,
-			.wiki-page-content,
-			.content-view {
-				margin: 0 !important;
-				padding: 0 !important; /* Managed by @page */
-				width: 100% !important;
-				max-width: 100% !important;
-				font-family: "Times New Roman", Times, serif !important;
-				font-size: 14pt !important;
-			}
+            content_html = _clean_for_pdf(_md_to_html(p.content or ""))
+            groups[-1]["pages"].append({"title": p.title, "content_html": content_html})
 
-			/* Explicitly hide the page title from show.html template and other UI */
-			.admin-banner, .sidebar-column, .page-toc, .wiki-footer, .wiki-page-meta, .navbar, .page-head, .modal, .wiki-editor { 
-				display: none !important; 
-			}
-			
-			p, li, div {
-				text-align: left !important;
-				text-justify: none !important;
-				letter-spacing: normal !important;
-				word-spacing: normal !important;
-				font-family: "Times New Roman", Times, serif !important;
-			}
+    # ── 3. Build HTML body ────────────────────────────────────────────────────
+    body_parts = []
+    first_block = True
 
-			* {
-				font-family: "Times New Roman", Times, serif !important;
-				box-sizing: border-box !important;
-				max-width: 100% !important;
-			}
+    for group in groups:
+        pb = "" if first_block else "page-break-before: always;"
 
-			/* Unset Bootstrap/Frappe container widths */
-			.container, .container-fluid, .page-container {
-				width: 100% !important;
-				max-width: none !important;
-				padding: 0 !important;
-				margin: 0 !important;
-			}
+        g_html = f'<div style="{pb}">'
 
-			/* Block display to kill flexbox constraints */
-			.main-column, .doc-main, .row, [class*="col-"] {
-				display: block !important;
-				width: 100% !important;
-				max-width: none !important;
-				flex: none !important;
-				padding: 0 !important;
-				margin: 0 !important;
-				float: none !important;
-			}
-			
-			img { max-width: 100% !important; height: auto !important; }
-			
-			 /* Tables */
-			table { width: 100% !important; table-layout: fixed !important; border-collapse: collapse !important; }
-			td, th { border: 1px solid #ddd !important; padding: 8px !important; background-color: transparent !important; }
-			
-			/* Text content visibility */
-			p, h1, h2, h3, h4, h5, h6, li, span, div {
-				color: black !important;
-				opacity: 1 !important;
-			}
+        if group["label"]:
+            g_html += f'<h1 class="group-name">{group["label"]}</h1>'
 
-			/* Bold Headings */
-			h1, h2, h3, h4, h5, h6 {
-				font-weight: bold !important;
-				font-size: 16pt !important;
-				font-family: "Times New Roman", Times, serif !important;
-			}
+        for p_idx, page in enumerate(group["pages"]):
+            if p_idx == 0:
+                # First page in group: flows directly under group heading
+                g_html += f'<h1 class="page-title">{page["title"]}</h1>'
+                g_html += page["content_html"]
+            else:
+                # Subsequent pages: new page
+                g_html += f'<div style="page-break-before: always;">'
+                g_html += f'<h1 class="page-title">{page["title"]}</h1>'
+                g_html += page["content_html"]
+                g_html += '</div>'
 
-			/* Links */
-			a { text-decoration: underline !important; color: black !important; }
-			
-			/* Video Link Box specific styling to look good in B&W or Color */
-			.pdf-video-link {
-				border: 1px solid #ccc !important;
-				padding: 10px !important;
-				margin: 10px 0 !important;
-				display: block !important;
-				background-color: #f5f5f5 !important;
-			}
-	</style>
-	"""
+        g_html += '</div>'
+        body_parts.append(g_html)
+        first_block = False
 
-	# CORRECTED FOOTER HTML - with proper wkhtmltopdf script tags
-	footer_html = """<!DOCTYPE html>
-<html>
-<head>
-	<script>
-		function subst() {
-			var vars = {};
-			var query_strings_from_url = document.location.search.substring(1).split('&');
-			for (var query_string in query_strings_from_url) {
-				if (query_strings_from_url.hasOwnProperty(query_string)) {
-					var temp_var = query_strings_from_url[query_string].split('=', 2);
-					vars[temp_var[0]] = decodeURI(temp_var[1]);
-				}
-			}
-			var css_selector_classes = ['page', 'frompage', 'topage', 'webpage', 'section', 'subsection', 'date', 'isodate', 'time', 'title', 'doctitle', 'sitepage', 'sitepages'];
-			for (var css_class in css_selector_classes) {
-				if (css_selector_classes.hasOwnProperty(css_class)) {
-					var element = document.getElementsByClassName(css_selector_classes[css_class]);
-					for (var j = 0; j < element.length; ++j) {
-						element[j].textContent = vars[css_selector_classes[css_class]];
-					}
-				}
-			}
-		}
-	</script>
-</head>
-<body style="border:0; margin: 0;" onload="subst()">
-	<div style="font-family: 'Times New Roman', Times, serif; font-size: 10pt; text-align: center; width: 100%;">
-		<span class="page"></span>
-	</div>
-</body>
-</html>"""
+    html = _wrap("\n".join(body_parts))
 
-	# Write footer HTML to a temporary file
-	footer_path = ""
-	with tempfile.NamedTemporaryFile(suffix=".html", delete=False, mode="w", encoding="utf-8") as f:
-		f.write(footer_html)
-		footer_path = f.name
+    # ── 4. Filename ───────────────────────────────────────────────────────────
+    if wiki_group_item and frappe.db.exists("Wiki Space", wiki_group_item.parent):
+        space = frappe.get_doc("Wiki Space", wiki_group_item.parent)
+        filename = space.space_name or space.route or page_doc.title
+    else:
+        filename = page_doc.title
 
-	options = {
-		"enable-local-file-access": "",
-		"disable-smart-shrinking": "",
-		"quiet": None,
-		"encoding": "UTF-8",
+    if not str(filename).lower().endswith(".pdf"):
+        filename = f"{filename}.pdf"
 
-		# Page setup
-		"page-size": "A4",
-		
-		# Margins - footer needs space at bottom
-		"margin-top": "10mm",
-		"margin-bottom": "30mm",  # Must be enough for footer
-		"margin-left": "10mm",
-		"margin-right": "10mm",
+    # ── 5. Render PDF ─────────────────────────────────────────────────────────
+    footer_path = _write_footer()
+    try:
+        frappe.local.response.filecontent = get_pdf(html, options=_pdf_options(footer_path))
+    finally:
+        if footer_path and os.path.exists(footer_path):
+            os.remove(footer_path)
 
-		# Footer configuration
-		"footer-html": footer_path,
-		"footer-spacing": "5",  # Space between content and footer
-	}
-
-	# 5. Set Filename
-	# Use Space Name if available, else Page Title
-	if wiki_group_item and frappe.db.exists("Wiki Space", wiki_group_item.parent):
-		space = frappe.get_doc("Wiki Space", wiki_group_item.parent)
-		filename = space.space_name or space.route
-		if not filename:
-			filename = page_doc.title
-	else:
-		filename = page_doc.title
-
-	# Ensure filename ends with .pdf
-	if not str(filename).lower().endswith('.pdf'):
-		filename = f"{filename}.pdf"
-
-	try:
-		frappe.local.response.filecontent = get_pdf(html, options=options)
-	finally:
-		# cleanup temp file
-		if footer_path and os.path.exists(footer_path):
-			os.remove(footer_path)
-
-	frappe.local.response.filename = filename
-	frappe.local.response.type = "pdf"
+    frappe.local.response.filename = filename
+    frappe.local.response.type = "pdf"
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# SECONDARY ENDPOINT – download entire Wiki Space by route
+# ─────────────────────────────────────────────────────────────────────────────
 
 @frappe.whitelist(allow_guest=True)
 def download_full_wiki_space(wiki_space):
-	"""
-	wiki_space = route of the root wiki page
-	example: creche-manual
-	"""
+    """wiki_space = route of the root wiki page, e.g. 'creche-manual'."""
+    root = frappe.get_doc("Wiki Page", {"route": wiki_space})
 
-	# -------------------------------------------------
-	# 1. Get root wiki page
-	# -------------------------------------------------
-	root = frappe.get_doc("Wiki Page", {"route": wiki_space})
+    all_pages = frappe.get_all(
+        "Wiki Page",
+        filters={"published": 1},
+        fields=["name", "title", "content", "route", "parent_wiki_page", "creation"],
+        order_by="creation asc",
+    )
 
-	# -------------------------------------------------
-	# 2. Fetch ALL published wiki pages
-	# -------------------------------------------------
-	all_pages = frappe.get_all(
-		"Wiki Page",
-		filters={"published": 1},
-		fields=[
-			"name",
-			"title",
-			"content",
-			"route",
-			"parent_wiki_page",
-			"creation",
-		],
-		order_by="creation asc",
-	)
+    pages = [p for p in all_pages if p.name == root.name or p.parent_wiki_page == root.name]
 
-	# -------------------------------------------------
-	# 3. Keep only pages belonging to this wiki space
-	# -------------------------------------------------
-	pages = []
-	for p in all_pages:
-		if p.name == root.name or p.parent_wiki_page == root.name:
-			pages.append(p)
+    if not pages:
+        frappe.throw(_("No wiki pages found"))
 
-	if not pages:
-		frappe.throw(_("No wiki pages found"))
+    # Optional covers
+    front_cover_type = "None"
+    front_cover_html_content = ""
+    front_cover_image = ""
+    back_cover_type = "None"
+    back_cover_html_content = ""
+    back_cover_image = ""
 
-	# -------------------------------------------------
-	# 4. Build ONE HTML for ALL pages
-	# -------------------------------------------------
-	# -------------------------------------------------
-	# 4. Build ONE HTML for ALL pages
-	# -------------------------------------------------
-	
-	# Prepare Cover Content
-	cover_html = f"""
-	<div class="pdf-cover" style="text-align: center; page-break-after: always; display: flex; flex-direction: column; justify-content: center; height: 100vh;">
-		<h1 style="font-size: 48pt; margin-top: 40%;">{root.title}</h1>
-	</div>
-	"""
+    try:
+        settings = frappe.get_single("Wiki PDF Settings")
+        front_cover_type = settings.front_cover_type or "None"
+        front_cover_html_content = settings.front_cover_html or ""
+        front_cover_image = settings.front_cover_image or ""
+        back_cover_type = settings.back_cover_type or "None"
+        back_cover_html_content = settings.back_cover_html or ""
+        back_cover_image = settings.back_cover_image or ""
+    except Exception:
+        pass
 
-	# Prepare Back Cover Content
-	# We use local file path for image to ensure it loads
-	back_cover_image_path = frappe.get_app_path("wiki_pdf", "public", "images", "back_cover.jpg")
-	
-	if os.path.exists(back_cover_image_path):
-		back_cover_html = f"""
-		<div class="pdf-back-cover" style="page-break-before: always; width: 100%; height: 100vh; background-image: url('file://{back_cover_image_path}'); background-size: cover; background-position: center;">
-			<!-- Image background covers the page -->
-		</div>
-		"""
-	else:
-		back_cover_html = ""
+    def _image_url(url):
+        if url.startswith("/files/"):
+            path = frappe.get_site_path("public", "files", url.split("/")[-1])
+            if os.path.exists(path):
+                return f"file://{path}"
+        return f"http://localhost:8004{url}"
 
-	html = """
-	<html>
-	<head>
-		<style>
-			body { 
-				font-family: "Times New Roman", Times, serif; 
-				font-size: 14pt;
-				line-height: 1.35;
-				margin: 0;
-				padding: 0;
-			}
-			h1 { 
-				font-weight: bold;
-			}
-			img { max-width: 100%; height: auto; }
-			
-			/* Ensure cover page has no header/footer if possible via CSS (difficult in wkhtmltopdf without JS) */
-		</style>
-	</head>
-	<body>
-	"""
+    cover_html = ""
+    if front_cover_type == "Standard":
+        cover_html = (
+            f'<div style="page-break-after:always;text-align:center;padding-top:40%;">'
+            f'<h1 style="font-size:48pt;">{root.title}</h1></div>'
+        )
+    elif front_cover_type == "Custom HTML":
+        cover_html = f'<div style="page-break-after:always;">{front_cover_html_content}</div>'
+    elif front_cover_type == "Image" and front_cover_image:
+        img = _image_url(front_cover_image)
+        cover_html = (
+            f'<div style="page-break-after:always;width:100%;height:1100px;'
+            f'background-image:url(\'{img}\');background-size:cover;background-position:center;"></div>'
+        )
 
-	# Add Cover
-	html += cover_html
+    back_cover_html = ""
+    if back_cover_type == "Standard":
+        path = frappe.get_app_path("wiki_pdf", "public", "images", "back_cover.jpg")
+        if os.path.exists(path):
+            back_cover_html = (
+                f'<div style="page-break-before:always;width:100%;height:1100px;'
+                f'background-image:url(\'file://{path}\');background-size:cover;'
+                f'background-position:center;"></div>'
+            )
+    elif back_cover_type == "Custom HTML":
+        back_cover_html = f'<div style="page-break-before:always;">{back_cover_html_content}</div>'
+    elif back_cover_type == "Image" and back_cover_image:
+        img = _image_url(back_cover_image)
+        back_cover_html = (
+            f'<div style="page-break-before:always;width:100%;height:1100px;'
+            f'background-image:url(\'{img}\');background-size:cover;background-position:center;"></div>'
+        )
 
-	for page in pages:
-		# Add page break before each new page title, except the very first one if it follows cover immediately (optional, but good practice)
-		page_break = "page-break-before: always;" 
-		
-		html += f"""
-		<div style="{page_break}">
-			<h1>{page.title}</h1>
-			<div>{page.content}</div>
-		</div>
-		"""
+    body_parts = [cover_html] if cover_html else []
 
-	# Add Back Cover
-	html += back_cover_html
+    for i, page in enumerate(pages):
+        pb = "" if (i == 0 and not cover_html) else "page-break-before: always;"
+        content_html = _clean_for_pdf(_md_to_html(page.content or ""))
+        body_parts.append(
+            f'<div style="{pb}"><h1 class="page-title">{page.title}</h1>{content_html}</div>'
+        )
 
-	html += "</body></html>"
+    if back_cover_html:
+        body_parts.append(back_cover_html)
 
-	# -------------------------------------------------
-	# 5. Footer HTML with page numbers
-	# -------------------------------------------------
-	footer_html = """<!DOCTYPE html>
-<html>
-<head>
-	<script>
-		function subst() {
-			var vars = {};
-			var query_strings_from_url = document.location.search.substring(1).split('&');
-			for (var query_string in query_strings_from_url) {
-				if (query_strings_from_url.hasOwnProperty(query_string)) {
-					var temp_var = query_strings_from_url[query_string].split('=', 2);
-					vars[temp_var[0]] = decodeURI(temp_var[1]);
-				}
-			}
-			var css_selector_classes = ['page', 'frompage', 'topage', 'webpage', 'section', 'subsection', 'date', 'isodate', 'time', 'title', 'doctitle', 'sitepage', 'sitepages'];
-			for (var css_class in css_selector_classes) {
-				if (css_selector_classes.hasOwnProperty(css_class)) {
-					var element = document.getElementsByClassName(css_selector_classes[css_class]);
-					for (var j = 0; j < element.length; ++j) {
-						element[j].textContent = vars[css_selector_classes[css_class]];
-					}
-				}
-			}
-		}
-	</script>
-</head>
-<body style="border:0; margin: 0;" onload="subst()">
-	<div style="font-family: 'Times New Roman', Times, serif; font-size: 10pt; text-align: center; width: 100%;">
-		<span class="page"></span>
-	</div>
-</body>
-</html>"""
+    html = _wrap("\n".join(body_parts))
 
-	footer_path = ""
-	with tempfile.NamedTemporaryFile(suffix=".html", delete=False, mode="w", encoding="utf-8") as f:
-		f.write(footer_html)
-		footer_path = f.name
+    footer_path = _write_footer()
+    try:
+        pdf = get_pdf(html, options=_pdf_options(footer_path))
+    finally:
+        if footer_path and os.path.exists(footer_path):
+            os.remove(footer_path)
 
-	options = {
-		"enable-local-file-access": "",
-		"disable-smart-shrinking": "",
-		"quiet": None,
-		"encoding": "UTF-8",
-		"page-size": "A4",
-		"margin-top": "10mm",
-		"margin-bottom": "30mm",
-		"margin-left": "10mm",
-		"margin-right": "10mm",
-		"footer-html": footer_path,
-		"footer-spacing": "5",
-	}
+    space_doc = frappe.db.get_value("Wiki Space", {"route": wiki_space}, ["space_name"], as_dict=True)
+    filename = (space_doc.space_name if space_doc else None) or root.title or wiki_space
+    if not filename.lower().endswith(".pdf"):
+        filename += ".pdf"
 
-	# -------------------------------------------------
-	# 6. Convert HTML → PDF
-	# -------------------------------------------------
-	try:
-		pdf = get_pdf(html, options=options)
-	finally:
-		if footer_path and os.path.exists(footer_path):
-			os.remove(footer_path)
-
-	# -------------------------------------------------
-	# 7. Send PDF as download
-	# -------------------------------------------------
-	
-	# Fix Filename Logic
-	# Get space doc to check for title
-	space_doc = frappe.db.get_value("Wiki Space", {"route": wiki_space}, ["space_name"], as_dict=True)
-	
-	if space_doc:
-		filename = space_doc.space_name or wiki_space
-	else:
-		filename = root.title or wiki_space
-		
-	# Ensure pdf extension
-	if not filename.lower().endswith(".pdf"):
-		filename += ".pdf"
-		
-	frappe.local.response.filename = filename
-	frappe.local.response.filecontent = pdf
-	frappe.local.response.type = "download"
+    frappe.local.response.filename = filename
+    frappe.local.response.filecontent = pdf
+    frappe.local.response.type = "download"
