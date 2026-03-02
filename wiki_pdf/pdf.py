@@ -10,6 +10,8 @@ import os
 from bs4 import BeautifulSoup
 from frappe.core.doctype.file.utils import find_file_by_url
 import time
+import requests
+from urllib.parse import urlparse
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -25,6 +27,9 @@ _MD_EXTRAS = [
     "header-ids",
     "footnotes",
 ]
+
+# 1x1 transparent PNG
+EMPTY_IMAGE = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
 
 
 def _md_to_html(text):
@@ -154,17 +159,17 @@ def _clean_for_pdf(html):
 
 def _inline_all_images(html):
     """
-    Optimized image inliner:
-    1. Uses a local cache to avoid redundant DB lookups.
-    2. Uses absolute disk paths instead of base64 where possible (much faster).
-    3. Skips very large images (> 5MB) to avoid memory bloat.
+    No-Network Guarantee:
+    1. Resolve local files to absolute disk paths (fastest, keeps memory low).
+    2. Fetch and Base64 remote images so wkhtmltopdf never needs to go online.
+    3. Use a 1x1 transparent fallback for ANY failed image to prevent crashes.
     """
     soup = BeautifulSoup(html, "html.parser")
     images_found = False
-    cache = {} # {src: resolved_path_or_b64}
+    cache = {} # {src: resolved_to}
     
     # Track stats for logging
-    stats = {"count": 0, "cached": 0, "disk": 0, "b64": 0, "skipped": 0}
+    stats = {"count": 0, "disk": 0, "remote": 0, "fallback": 0, "skipped": 0}
 
     for img in soup.find_all("img"):
         src = img.get("src")
@@ -175,69 +180,63 @@ def _inline_all_images(html):
         
         if src in cache:
             img["src"] = cache[src]
-            stats["cached"] += 1
             images_found = True
             continue
 
-        # Skip already base64 encoded images
         if src.startswith("data:"):
             continue
 
         try:
-            path = src
-            if "://" in src:
-                from urllib.parse import urlparse
-                parsed = urlparse(src)
-                if parsed.netloc == frappe.utils.get_host_name():
-                    path = parsed.path
-                else:
-                    continue
-
-            # Find the file in Frappe
-            file_doc = find_file_by_url(path)
-            if not file_doc:
-                continue
-
-            full_path = file_doc.get_full_path()
+            resolved = None
             
-            # If it's a local file and accessible, use the absolute disk path
-            # wkhtmltopdf with --enable-local-file-access handles this much better than b64
-            if full_path and os.path.exists(full_path):
-                # Check size: if > 5MB, maybe skip or log warning?
-                if os.path.getsize(full_path) > 5 * 1024 * 1024:
-                    frappe.logger("wiki_pdf").warning(f"Large image skipped: {src} ({os.path.getsize(full_path)/1024/1024:.2f}MB)")
-                    stats["skipped"] += 1
-                    continue
+            # ── A. Handle Local Paths (/files/...) ──
+            path = src
+            is_local = False
+            if "://" not in src or src.startswith(frappe.utils.get_url()):
+                is_local = True
+                if "://" in src:
+                    path = urlparse(src).path
                 
-                # Using absolute disk paths directly.
-                # wkhtmltopdf handles raw paths best when local access is enabled.
-                resolved = os.path.abspath(full_path)
-                img["src"] = resolved
-                cache[src] = resolved
-                stats["disk"] += 1
-                images_found = True
-            else:
-                # Fallback to base64 if it's not on disk for some reason
-                content = file_doc.get_content()
-                if not content or len(content) > 5 * 1024 * 1024:
-                    stats["skipped"] += 1
-                    continue
+                file_doc = find_file_by_url(path)
+                if file_doc:
+                    full_path = file_doc.get_full_path()
+                    if full_path and os.path.exists(full_path):
+                        resolved = os.path.abspath(full_path)
+                        stats["disk"] += 1
 
-                mime_type = mimetypes.guess_type(path)[0] or "image/png"
-                b64_data = base64.b64encode(content).decode("utf-8")
-                resolved = f"data:{mime_type};base64,{b64_data}"
-                img["src"] = resolved
-                cache[src] = resolved
-                stats["b64"] += 1
-                images_found = True
+            # ── B. Handle Remote URLs (if not local) ──
+            if not resolved and not is_local:
+                try:
+                    resp = requests.get(src, timeout=5)
+                    if resp.status_code == 200:
+                        mime = resp.headers.get("Content-Type", "image/png")
+                        b64 = base64.b64encode(resp.content).decode("utf-8")
+                        resolved = f"data:{mime};base64,{b64}"
+                        stats["remote"] += 1
+                except:
+                    pass
+
+            # ── C. Final Logic & Fallback ──
+            if not resolved:
+                # If we can't find it or fetch it, use a tiny invisible pixel
+                # This prevents wkhtmltopdf from making a network call and failing (exit 1)
+                resolved = EMPTY_IMAGE
+                stats["fallback"] += 1
+            
+            img["src"] = resolved
+            cache[src] = resolved
+            images_found = True
 
         except Exception as e:
-            frappe.logger("wiki_pdf").error(f"Failed to inline image {src}: {str(e)}")
+            # Absolute last resort: just hide it
+            img["src"] = EMPTY_IMAGE
+            frappe.logger("wiki_pdf").error(f"Image Inliner Failed on {src}: {str(e)}")
 
-    if images_found:
-        frappe.logger("wiki_pdf").debug(f"Image Optimizer Stats: {stats}")
-        return str(soup)
-    return html
+    # Stripping tags that trigger network or JS
+    for tag in soup(["script", "link", "iframe", "audio", "video"]):
+        tag.decompose()
+
+    return str(soup)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -547,14 +546,8 @@ def download_wiki_pdf(page_name=None, route=None):
     # ── 5. Render PDF ─────────────────────────────────────────────────────────
     start_render = time.time()
     
-    # Bypass frappe.get_pdf to ensure local-file-access is NOT disabled by Frappe's wrapper
-    try:
-        pdf_content = pdfkit.from_string(html, options=_pdf_options() or {})
-    except Exception as e:
-        frappe.logger("wiki_pdf").error(f"PDFKit Error: {str(e)}")
-        # Fallback to Frappe's wrapper if direct call fails
-        pdf_content = get_pdf(html, options=_pdf_options())
-        
+    # Direct PDFKit call – No-Network Guarantee makes this safe.
+    pdf_content = pdfkit.from_string(html, options=_pdf_options() or {})
     duration_render = time.time() - start_render
     
     frappe.logger("wiki_pdf").debug(
@@ -601,11 +594,7 @@ def download_full_wiki_space(wiki_space):
 
     html = _wrap("\n".join(body_parts))
 
-    try:
-        pdf = pdfkit.from_string(html, options=_pdf_options() or {})
-    except Exception as e:
-        frappe.logger("wiki_pdf").error(f"PDFKit Error in Space Download: {str(e)}")
-        pdf = get_pdf(html, options=_pdf_options())
+    pdf = pdfkit.from_string(html, options=_pdf_options() or {})
 
     if not pdf:
         frappe.throw(_("Generated PDF is empty for this space."))
