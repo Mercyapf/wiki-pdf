@@ -35,6 +35,8 @@ function add_download_pdf_button() {
     $btn = $('<a>')
         .attr('id', 'btn-download-wiki-pdf')
         .attr('href', download_url)
+        .attr('target', '_blank')
+        .attr('rel', 'noopener noreferrer')
         .addClass('navbar-link mr-2 d-print-none')
         .css({
             'white-space': 'nowrap',

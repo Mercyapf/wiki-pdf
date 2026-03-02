@@ -1,8 +1,6 @@
 import frappe
 from frappe.utils.pdf import get_pdf
 from frappe import _
-import tempfile
-import os
 import re
 import markdown2
 
@@ -289,45 +287,7 @@ td {
 .pdf-summary { font-weight: bold; }
 """
 
-FOOTER_HTML = """<!DOCTYPE html>
-<html>
-<head>
-<script>
-function subst() {
-    var vars = {};
-    var qs = document.location.search.substring(1).split('&');
-    for (var i in qs) {
-        if (qs.hasOwnProperty(i)) {
-            var kv = qs[i].split('=', 2);
-            vars[kv[0]] = decodeURI(kv[1]);
-        }
-    }
-    var cls = ['page','frompage','topage','webpage','section','subsection',
-               'date','isodate','time','title','doctitle','sitepage','sitepages'];
-    for (var c in cls) {
-        if (cls.hasOwnProperty(c)) {
-            var els = document.getElementsByClassName(cls[c]);
-            for (var j = 0; j < els.length; ++j) { els[j].textContent = vars[cls[c]]; }
-        }
-    }
-}
-</script>
-</head>
-<body style="border:0;margin:0;" onload="subst()">
-<div style="font-family:Georgia,serif;font-size:10pt;text-align:center;width:100%;">
-    <span class="page"></span>
-</div>
-</body>
-</html>"""
-
-
-def _write_footer():
-    with tempfile.NamedTemporaryFile(suffix=".html", delete=False, mode="w", encoding="utf-8") as f:
-        f.write(FOOTER_HTML)
-        return f.name
-
-
-def _pdf_options(footer_path):
+def _pdf_options():
     return {
         "enable-local-file-access": "",
         "disable-smart-shrinking": "",
@@ -338,7 +298,9 @@ def _pdf_options(footer_path):
         "margin-bottom": "18mm",
         "margin-left": "18mm",
         "margin-right": "18mm",
-        "footer-html": footer_path,
+        "footer-center": "[page]",
+        "footer-font-name": "Georgia",
+        "footer-font-size": "10",
         "footer-spacing": "5",
     }
 
@@ -473,13 +435,7 @@ def download_wiki_pdf(page_name=None, route=None):
         filename = f"{filename}.pdf"
 
     # ── 5. Render PDF ─────────────────────────────────────────────────────────
-    footer_path = _write_footer()
-    try:
-        frappe.local.response.filecontent = get_pdf(html, options=_pdf_options(footer_path))
-    finally:
-        if footer_path and os.path.exists(footer_path):
-            os.remove(footer_path)
-
+    frappe.local.response.filecontent = get_pdf(html, options=_pdf_options())
     frappe.local.response.filename = filename
     frappe.local.response.type = "pdf"
 
@@ -505,85 +461,18 @@ def download_full_wiki_space(wiki_space):
     if not pages:
         frappe.throw(_("No wiki pages found"))
 
-    # Optional covers
-    front_cover_type = "None"
-    front_cover_html_content = ""
-    front_cover_image = ""
-    back_cover_type = "None"
-    back_cover_html_content = ""
-    back_cover_image = ""
-
-    try:
-        settings = frappe.get_single("Wiki PDF Settings")
-        front_cover_type = settings.front_cover_type or "None"
-        front_cover_html_content = settings.front_cover_html or ""
-        front_cover_image = settings.front_cover_image or ""
-        back_cover_type = settings.back_cover_type or "None"
-        back_cover_html_content = settings.back_cover_html or ""
-        back_cover_image = settings.back_cover_image or ""
-    except Exception:
-        pass
-
-    def _image_url(url):
-        if url.startswith("/files/"):
-            path = frappe.get_site_path("public", "files", url.split("/")[-1])
-            if os.path.exists(path):
-                return f"file://{path}"
-        return f"http://localhost:8004{url}"
-
-    cover_html = ""
-    if front_cover_type == "Standard":
-        cover_html = (
-            f'<div style="page-break-after:always;text-align:center;padding-top:40%;">'
-            f'<h1 style="font-size:48pt;">{root.title}</h1></div>'
-        )
-    elif front_cover_type == "Custom HTML":
-        cover_html = f'<div style="page-break-after:always;">{front_cover_html_content}</div>'
-    elif front_cover_type == "Image" and front_cover_image:
-        img = _image_url(front_cover_image)
-        cover_html = (
-            f'<div style="page-break-after:always;width:100%;height:1100px;'
-            f'background-image:url(\'{img}\');background-size:cover;background-position:center;"></div>'
-        )
-
-    back_cover_html = ""
-    if back_cover_type == "Standard":
-        path = frappe.get_app_path("wiki_pdf", "public", "images", "back_cover.jpg")
-        if os.path.exists(path):
-            back_cover_html = (
-                f'<div style="page-break-before:always;width:100%;height:1100px;'
-                f'background-image:url(\'file://{path}\');background-size:cover;'
-                f'background-position:center;"></div>'
-            )
-    elif back_cover_type == "Custom HTML":
-        back_cover_html = f'<div style="page-break-before:always;">{back_cover_html_content}</div>'
-    elif back_cover_type == "Image" and back_cover_image:
-        img = _image_url(back_cover_image)
-        back_cover_html = (
-            f'<div style="page-break-before:always;width:100%;height:1100px;'
-            f'background-image:url(\'{img}\');background-size:cover;background-position:center;"></div>'
-        )
-
-    body_parts = [cover_html] if cover_html else []
+    body_parts = []
 
     for i, page in enumerate(pages):
-        pb = "" if (i == 0 and not cover_html) else "page-break-before: always;"
+        pb = "" if i == 0 else "page-break-before: always;"
         content_html = _clean_for_pdf(_md_to_html(page.content or ""))
         body_parts.append(
             f'<div style="{pb}"><h1 class="page-title">{page.title}</h1>{content_html}</div>'
         )
 
-    if back_cover_html:
-        body_parts.append(back_cover_html)
-
     html = _wrap("\n".join(body_parts))
 
-    footer_path = _write_footer()
-    try:
-        pdf = get_pdf(html, options=_pdf_options(footer_path))
-    finally:
-        if footer_path and os.path.exists(footer_path):
-            os.remove(footer_path)
+    pdf = get_pdf(html, options=_pdf_options())
 
     space_doc = frappe.db.get_value("Wiki Space", {"route": wiki_space}, ["space_name"], as_dict=True)
     filename = (space_doc.space_name if space_doc else None) or root.title or wiki_space
@@ -592,4 +481,4 @@ def download_full_wiki_space(wiki_space):
 
     frappe.local.response.filename = filename
     frappe.local.response.filecontent = pdf
-    frappe.local.response.type = "download"
+    frappe.local.response.type = "pdf"
