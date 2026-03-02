@@ -18,7 +18,9 @@ _MD_EXTRAS = [
     "fenced-code-blocks",
     "strike",
     "cuddled-lists",
-    "break-on-newline",
+    # NOTE: "break-on-newline" is intentionally excluded.
+    # It converts every '\n' to <br>, which turns blank lines inside
+    # blockquotes / paragraphs into large empty spaces in the PDF.
     "header-ids",
     "footnotes",
 ]
@@ -119,6 +121,21 @@ def _split_tables(html, max_rows=15):
     return html
 
 
+def _strip_blank_nodes(html):
+    """
+    Remove visual empty space left by:
+      - Consecutive <br> tags  (max 1 allowed in a row)
+      - Empty <p> / <p>&nbsp;</p> / whitespace-only <p> tags
+      - Sequences of \\n<br>\\n inside blockquotes
+    This is the main fix for the large blank gaps inside blockquote boxes.
+    """
+    # Collapse 2+ consecutive <br> tags (with optional whitespace between) to a single <br>
+    html = re.sub(r'(<br\s*/?>\s*){2,}', '<br>', html, flags=re.IGNORECASE)
+    # Remove completely empty <p> tags (including those with only whitespace or &nbsp;)
+    html = re.sub(r'<p[^>]*>\s*(&nbsp;)?\s*</p>', '', html, flags=re.IGNORECASE)
+    return html
+
+
 def _clean_for_pdf(html):
     def replace_iframe(match):
         src = re.search(r'src=["\']([^"\']+)["\']', match.group(0))
@@ -143,6 +160,9 @@ def _clean_for_pdf(html):
     html = re.sub(r'</details>', '</div>', html, flags=re.IGNORECASE)
     html = re.sub(r'<summary[^>]*>', '<span class="pdf-summary">', html, flags=re.IGNORECASE)
     html = re.sub(r'</summary>', '</span><br>', html, flags=re.IGNORECASE)
+
+    # Collapse consecutive <br> and strip empty <p> tags (fixes large gaps in blockquotes)
+    html = _strip_blank_nodes(html)
 
     # Split large tables → multiple sub-tables so page-break-inside:avoid works
     html = _split_tables(html)
@@ -251,9 +271,19 @@ blockquote {
     border-left: 4pt solid #555;
     border-radius: 3pt;
     background: #f7f7f7;
-    margin: 8pt 0;
-    padding: 8pt 14pt;
-    page-break-inside: avoid;
+    margin: 6pt 0;
+    padding: 6pt 12pt;
+    /* page-break-inside:avoid removed — it causes large blank gaps when the
+       blockquote is taller than the remaining page space */
+}
+
+/* Tighten paragraph spacing INSIDE blockquotes so blank lines don't create large gaps */
+blockquote p {
+    margin: 1pt 0;
+}
+
+blockquote br {
+    display: none;  /* suppress any residual <br> inside blockquotes */
 }
 
 /* ── Tables ── */
@@ -325,9 +355,10 @@ def _pdf_options():
         "disable-javascript": "",
         "no-stop-slow-scripts": "",
         "no-outline": None,
-        "no-pdf-compression": "",
+        # NOTE: do NOT add "no-pdf-compression" — it bloats the file to 100MB+
         "javascript-delay": "200",
-        "image-quality": "80", # Reduce size for 150 pages
+        "image-quality": "60",   # Compress images more (was 80)
+        "image-dpi": "150",      # Cap image resolution (screen-quality is fine for PDF)
     }
 
 
