@@ -1,13 +1,17 @@
 import frappe
 from frappe.utils.pdf import get_pdf
+# import pdfkit
 from frappe import _
 import re
 import markdown2
+import base64
+import mimetypes
 import os
-import time
-import tempfile
-import pdfkit
 from bs4 import BeautifulSoup
+from frappe.core.doctype.file.utils import find_file_by_url
+# import time
+import requests
+from urllib.parse import urlparse
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -19,10 +23,13 @@ _MD_EXTRAS = [
     "fenced-code-blocks",
     "strike",
     "cuddled-lists",
-    "break-on-newline",   # needed so list items (i. ii. iii.) each appear on their own line
+    "break-on-newline",
     "header-ids",
     "footnotes",
 ]
+
+# 1x1 transparent PNG
+EMPTY_IMAGE = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
 
 
 def _md_to_html(text):
@@ -120,59 +127,6 @@ def _split_tables(html, max_rows=15):
     return html
 
 
-def _trim_blockquotes(soup):
-    """
-    Use BeautifulSoup to walk every <blockquote> and strip trailing
-    whitespace/br/empty-p nodes from its end.  This is the reliable fix for
-    the large blank gap that appears at the bottom of blockquote boxes in the PDF.
-
-    Also collapses runs of 3+ sibling <br> tags inside blockquotes to a single <br>.
-    """
-    from bs4 import NavigableString, Tag
-
-    def _is_blank(node):
-        """Return True if `node` contributes nothing visible."""
-        if isinstance(node, NavigableString):
-            return node.strip() == ""
-        if isinstance(node, Tag):
-            if node.name == "br":
-                return True
-            if node.name in ("p", "div", "span"):
-                return node.get_text(strip=True) == "" and not node.find("img")
-        return False
-
-    for bq in soup.find_all("blockquote"):
-        # Strip trailing blank nodes
-        children = list(bq.children)
-        while children and _is_blank(children[-1]):
-            children[-1].extract()
-            children = list(bq.children)
-
-        # Collapse runs of 3+ consecutive <br> siblings to one <br>
-        children = list(bq.children)
-        run = []
-        for child in children:
-            if isinstance(child, Tag) and child.name == "br":
-                run.append(child)
-            else:
-                if len(run) > 2:          # keep at most 2 br's (= 1 blank line)
-                    for extra in run[1:]:
-                        extra.extract()
-                run = []
-        if len(run) > 2:
-            for extra in run[1:]:
-                extra.extract()
-
-    return soup
-
-
-def _strip_blank_nodes(html):
-    """Thin wrapper kept for call-site compatibility; real work done in _trim_blockquotes."""
-    # Also remove any top-level empty <p> tags
-    html = re.sub(r'<p[^>]*>\s*(&nbsp;)?\s*</p>', '', html, flags=re.IGNORECASE)
-    return html
-
-
 def _clean_for_pdf(html):
     def replace_iframe(match):
         src = re.search(r'src=["\']([^"\']+)["\']', match.group(0))
@@ -198,24 +152,90 @@ def _clean_for_pdf(html):
     html = re.sub(r'<summary[^>]*>', '<span class="pdf-summary">', html, flags=re.IGNORECASE)
     html = re.sub(r'</summary>', '</span><br>', html, flags=re.IGNORECASE)
 
-    # Collapse consecutive <br> and strip empty <p> tags (fixes large gaps in blockquotes)
-    html = _strip_blank_nodes(html)
-
     # Split large tables → multiple sub-tables so page-break-inside:avoid works
     html = _split_tables(html)
     return html
 
 
-def _prepare_html_for_pdf(html):
+def _inline_all_images(html):
     """
-    HTML cleanup before sending to wkhtmltopdf:
-    - Strips <script> and external <link> tags.
-    - Trims trailing blank nodes from every <blockquote> (fixes empty space at bottom of boxes).
+    No-Network Guarantee:
+    1. Resolve local files to absolute disk paths (fastest, keeps memory low).
+    2. Fetch and Base64 remote images so wkhtmltopdf never needs to go online.
+    3. Use a 1x1 transparent fallback for ANY failed image to prevent crashes.
     """
     soup = BeautifulSoup(html, "html.parser")
-    for tag in soup(["script", "link"]):
+    images_found = False
+    cache = {} # {src: resolved_to}
+    
+    # Track stats for logging
+    stats = {"count": 0, "disk": 0, "remote": 0, "fallback": 0, "skipped": 0}
+
+    for img in soup.find_all("img"):
+        src = img.get("src")
+        if not src:
+            continue
+        
+        stats["count"] += 1
+        
+        if src in cache:
+            img["src"] = cache[src]
+            images_found = True
+            continue
+
+        if src.startswith("data:"):
+            continue
+
+        try:
+            resolved = None
+            
+            # ── A. Handle Local Paths (/files/...) ──
+            path = src
+            is_local = False
+            if "://" not in src or src.startswith(frappe.utils.get_url()):
+                is_local = True
+                if "://" in src:
+                    path = urlparse(src).path
+                
+                file_doc = find_file_by_url(path)
+                if file_doc:
+                    full_path = file_doc.get_full_path()
+                    if full_path and os.path.exists(full_path):
+                        resolved = os.path.abspath(full_path)
+                        stats["disk"] += 1
+
+            # ── B. Handle Remote URLs (if not local) ──
+            if not resolved and not is_local:
+                try:
+                    resp = requests.get(src, timeout=5)
+                    if resp.status_code == 200:
+                        mime = resp.headers.get("Content-Type", "image/png")
+                        b64 = base64.b64encode(resp.content).decode("utf-8")
+                        resolved = f"data:{mime};base64,{b64}"
+                        stats["remote"] += 1
+                except:
+                    pass
+
+            # ── C. Final Logic & Fallback ──
+            if not resolved:
+                # If we can't find it or fetch it, use a tiny invisible pixel
+                # This prevents wkhtmltopdf from making a network call and failing (exit 1)
+                resolved = EMPTY_IMAGE
+                stats["fallback"] += 1
+            
+            img["src"] = resolved
+            cache[src] = resolved
+            images_found = True
+
+        except Exception as e:
+            # Absolute last resort: just hide it
+            img["src"] = EMPTY_IMAGE
+            frappe.logger("wiki_pdf").error(f"Image Inliner Failed on {src}: {str(e)}")
+
+    # Stripping tags that trigger network or JS
+    for tag in soup(["script", "link", "iframe", "audio", "video"]):
         tag.decompose()
-    _trim_blockquotes(soup)   # ← removes trailing br/empty-p from blockquotes
+
     return str(soup)
 
 
@@ -308,13 +328,10 @@ blockquote {
     border-left: 4pt solid #555;
     border-radius: 3pt;
     background: #f7f7f7;
-    margin: 6pt 0;
-    padding: 6pt 12pt;
-}
-
-/* Tighten paragraph spacing INSIDE blockquotes */
-blockquote p {
-    margin: 1pt 0;
+    margin: 4pt 0;
+    padding: 8pt 14pt;
+    break-inside: auto;
+    page-break-inside: auto;
 }
 
 /* ── Tables ── */
@@ -380,16 +397,15 @@ def _pdf_options():
         "footer-font-name": "Georgia",
         "footer-font-size": "10",
         "footer-spacing": "5",
-        # Prevent wkhtmltopdf from aborting on network errors
+        # Prevent wkhtmltopdf from aborting on network errors in cloud/server environments
         "load-error-handling": "ignore",
         "load-media-error-handling": "ignore",
         "disable-javascript": "",
         "no-stop-slow-scripts": "",
         "no-outline": None,
-        # NOTE: do NOT add "no-pdf-compression" — it bloats the file to 100MB+
-        # NOTE: no "javascript-delay" — JS is disabled so waiting is pointless
-        "image-quality": "60",
-        "image-dpi": "150",
+        "no-pdf-compression": "",
+        "javascript-delay": "10",
+        "image-quality": "80", # Reduce size for 150 pages
     }
 
 
@@ -402,7 +418,7 @@ def _wrap(body):
 </head>
 <body>{body}</body>
 </html>"""
-    return _prepare_html_for_pdf(html)
+    return _inline_all_images(html)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -528,28 +544,15 @@ def download_wiki_pdf(page_name=None, route=None):
     if not str(filename).lower().endswith(".pdf"):
         filename = f"{filename}.pdf"
 
-    # ── 5. Render PDF via temp file (faster than from_string for large docs) ────
+    # ── 5. Render PDF ─────────────────────────────────────────────────────────
     start_render = time.time()
-    config = getattr(frappe.local, "pdfkit_config", None)
-    pdf_content = None
-    tmp_html = None
-    try:
-        with tempfile.NamedTemporaryFile(suffix=".html", delete=False, mode="w", encoding="utf-8") as f:
-            f.write(html)
-            tmp_html = f.name
-        pdf_content = pdfkit.from_file(tmp_html, output_path=False, options=_pdf_options(), configuration=config)
-    except Exception as e:
-        frappe.logger("wiki_pdf").error(f"Render Error: {str(e)} | Falling back to get_pdf")
-        pdf_content = get_pdf(html, options=_pdf_options())
-    finally:
-        if tmp_html and os.path.exists(tmp_html):
-            os.unlink(tmp_html)
-
+    
+    # Direct PDFKit call – No-Network Guarantee makes this safe.
+    pdf_content = pdfkit.from_string(html, options=_pdf_options() or {})
     duration_render = time.time() - start_render
-
+    
     frappe.logger("wiki_pdf").debug(
-        f"PDF Stats: pages={sum(len(g['pages']) for g in groups)}, build={duration_build:.2f}s, "
-        f"wrap={duration_wrap:.2f}s, render={duration_render:.2f}s, size={len(html)/1024:.1f}KB"
+        f"PDF Stats: build={duration_build:.2f}s, wrap/inline={duration_wrap:.2f}s, render={duration_render:.2f}s, html_size={len(html)/1024:.1f}KB"
     )
 
     if not pdf_content:
@@ -557,8 +560,7 @@ def download_wiki_pdf(page_name=None, route=None):
 
     frappe.local.response.filecontent = pdf_content
     frappe.local.response.filename = filename
-    frappe.local.response.type = "download"
-    frappe.local.response.content_type = "application/pdf"
+    frappe.local.response.type = "pdf"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -567,88 +569,42 @@ def download_wiki_pdf(page_name=None, route=None):
 
 @frappe.whitelist(allow_guest=True)
 def download_full_wiki_space(wiki_space):
-    """
-    Download EVERY page in the Wiki Space hierarchy.
-    Instead of just immediate children, we use the Space's sidebar definition 
-    (Wiki Group Items) to ensure total coverage and correct order.
-    """
-    space_doc = frappe.db.get_value("Wiki Space", {"route": wiki_space}, ["name", "space_name"], as_dict=True)
-    if not space_doc:
-        frappe.throw(_("Wiki Space not found: {0}").format(wiki_space))
+    """wiki_space = route of the root wiki page, e.g. 'creche-manual'."""
+    root = frappe.get_doc("Wiki Page", {"route": wiki_space})
 
-    # Fetch all sidebar items for this space
-    sidebar_items = frappe.get_all(
-        "Wiki Group Item",
-        filters={"parent": space_doc.name},
-        fields=["wiki_page", "parent_label", "idx"],
-        order_by="idx asc",
-    )
-
-    if not sidebar_items:
-        frappe.throw(_("No pages found in this space's sidebar."))
-
-    # Bulk fetch content
-    page_names = [item.wiki_page for item in sidebar_items if item.wiki_page]
-    pages_data = frappe.get_all(
+    all_pages = frappe.get_all(
         "Wiki Page",
-        filters={"name": ["in", page_names]},
-        fields=["name", "title", "content"],
+        filters={"published": 1},
+        fields=["name", "title", "content", "route", "parent_wiki_page", "creation"],
+        order_by="creation asc",
     )
-    pages_map = {row.name: row for row in pages_data}
+
+    pages = [p for p in all_pages if p.name == root.name or p.parent_wiki_page == root.name]
+
+    if not pages:
+        frappe.throw(_("No wiki pages found"))
 
     body_parts = []
-    for i, item in enumerate(sidebar_items):
-        if item.wiki_page not in pages_map:
-            continue
-        p = pages_map[item.wiki_page]
-        
-        pb = "page-break-before: always;" if i > 0 else ""
-        content_html = _clean_for_pdf(_md_to_html(p.content or ""))
-        
-        # Optionally include parent label if it changes
-        label_html = ""
-        if item.parent_label and (i == 0 or sidebar_items[i-1].parent_label != item.parent_label):
-            label_html = f'<h1 class="group-name">{item.parent_label}</h1>'
 
+    for i, page in enumerate(pages):
+        pb = "" if i == 0 else "page-break-before: always;"
+        content_html = _clean_for_pdf(_md_to_html(page.content or ""))
         body_parts.append(
-            f'<div style="{pb}">{label_html}<h1 class="page-title">{p.title}</h1>{content_html}</div>'
+            f'<div style="{pb}"><h1 class="page-title">{page.title}</h1>{content_html}</div>'
         )
 
-    start_wrap = time.time()
     html = _wrap("\n".join(body_parts))
-    duration_wrap = time.time() - start_wrap
 
-    # ── 5. Render PDF via temp file ────────────────────────────────────────────
-    start_render = time.time()
-    config = getattr(frappe.local, "pdfkit_config", None)
-    pdf = None
-    tmp_html = None
-    try:
-        with tempfile.NamedTemporaryFile(suffix=".html", delete=False, mode="w", encoding="utf-8") as f:
-            f.write(html)
-            tmp_html = f.name
-        pdf = pdfkit.from_file(tmp_html, output_path=False, options=_pdf_options(), configuration=config)
-    except Exception as e:
-        frappe.logger("wiki_pdf").error(f"Space Render Error: {str(e)} | Falling back to get_pdf")
-        pdf = get_pdf(html, options=_pdf_options())
-    finally:
-        if tmp_html and os.path.exists(tmp_html):
-            os.unlink(tmp_html)
-
-    duration_render = time.time() - start_render
-
-    frappe.logger("wiki_pdf").debug(
-        f"PDF Space Stats: pages={len(sidebar_items)}, wrap={duration_wrap:.2f}s, render={duration_render:.2f}s"
-    )
+    pdf = pdfkit.from_string(html, options=_pdf_options() or {})
 
     if not pdf:
         frappe.throw(_("Generated PDF is empty for this space."))
 
-    filename = space_doc.space_name or wiki_space
+    space_doc = frappe.db.get_value("Wiki Space", {"route": wiki_space}, ["space_name"], as_dict=True)
+    filename = (space_doc.space_name if space_doc else None) or root.title or wiki_space
     if not filename.lower().endswith(".pdf"):
         filename += ".pdf"
 
     frappe.local.response.filename = filename
     frappe.local.response.filecontent = pdf
-    frappe.local.response.type = "download"  # "download" → Content-Disposition: attachment (saves file)
-    frappe.local.response.content_type = "application/pdf"
+    frappe.local.response.type = "pdf"
