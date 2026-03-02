@@ -1,5 +1,6 @@
 import frappe
 from frappe.utils.pdf import get_pdf
+import pdfkit
 from frappe import _
 import re
 import markdown2
@@ -8,6 +9,7 @@ import mimetypes
 import os
 from bs4 import BeautifulSoup
 from frappe.core.doctype.file.utils import find_file_by_url
+import time
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -152,15 +154,29 @@ def _clean_for_pdf(html):
 
 def _inline_all_images(html):
     """
-    Find all local images in the HTML and convert them to base64 strings.
-    This avoids wkhtmltopdf making network requests to the site itself.
+    Optimized image inliner:
+    1. Uses a local cache to avoid redundant DB lookups.
+    2. Uses absolute disk paths instead of base64 where possible (much faster).
+    3. Skips very large images (> 5MB) to avoid memory bloat.
     """
     soup = BeautifulSoup(html, "html.parser")
     images_found = False
+    cache = {} # {src: resolved_path_or_b64}
+    
+    # Track stats for logging
+    stats = {"count": 0, "cached": 0, "disk": 0, "b64": 0, "skipped": 0}
 
     for img in soup.find_all("img"):
         src = img.get("src")
         if not src:
+            continue
+        
+        stats["count"] += 1
+        
+        if src in cache:
+            img["src"] = cache[src]
+            stats["cached"] += 1
+            images_found = True
             continue
 
         # Skip already base64 encoded images
@@ -168,18 +184,13 @@ def _inline_all_images(html):
             continue
 
         try:
-            # Handle local paths (/files/...) or absolute paths with current host
             path = src
             if "://" in src:
                 from urllib.parse import urlparse
                 parsed = urlparse(src)
-                # If it's the same host or we want to be aggressive, we treat it as local
-                # For now, let's just take the path part if it's on the same site
                 if parsed.netloc == frappe.utils.get_host_name():
                     path = parsed.path
                 else:
-                    # External image: wkhtmltopdf will try to fetch it.
-                    # We could try to fetch it here and base64 it too, but let's start with local.
                     continue
 
             # Find the file in Frappe
@@ -187,20 +198,46 @@ def _inline_all_images(html):
             if not file_doc:
                 continue
 
-            content = file_doc.get_content()
-            if not content:
-                continue
+            full_path = file_doc.get_full_path()
+            
+            # If it's a local file and accessible, use the absolute disk path
+            # wkhtmltopdf with --enable-local-file-access handles this much better than b64
+            if full_path and os.path.exists(full_path):
+                # Check size: if > 5MB, maybe skip or log warning?
+                if os.path.getsize(full_path) > 5 * 1024 * 1024:
+                    frappe.logger("wiki_pdf").warning(f"Large image skipped: {src} ({os.path.getsize(full_path)/1024/1024:.2f}MB)")
+                    stats["skipped"] += 1
+                    continue
+                
+                # Using absolute disk paths directly.
+                # wkhtmltopdf handles raw paths best when local access is enabled.
+                resolved = os.path.abspath(full_path)
+                img["src"] = resolved
+                cache[src] = resolved
+                stats["disk"] += 1
+                images_found = True
+            else:
+                # Fallback to base64 if it's not on disk for some reason
+                content = file_doc.get_content()
+                if not content or len(content) > 5 * 1024 * 1024:
+                    stats["skipped"] += 1
+                    continue
 
-            mime_type = mimetypes.guess_type(path)[0] or "image/png"
-            b64_data = base64.b64encode(content).decode("utf-8")
-            img["src"] = f"data:{mime_type};base64,{b64_data}"
-            images_found = True
+                mime_type = mimetypes.guess_type(path)[0] or "image/png"
+                b64_data = base64.b64encode(content).decode("utf-8")
+                resolved = f"data:{mime_type};base64,{b64_data}"
+                img["src"] = resolved
+                cache[src] = resolved
+                stats["b64"] += 1
+                images_found = True
 
         except Exception as e:
-            # Log error but don't crash the whole PDF generation
-            frappe.logger().error(f"Failed to inline image {src}: {str(e)}")
+            frappe.logger("wiki_pdf").error(f"Failed to inline image {src}: {str(e)}")
 
-    return str(soup) if images_found else html
+    if images_found:
+        frappe.logger("wiki_pdf").debug(f"Image Optimizer Stats: {stats}")
+        return str(soup)
+    return html
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -367,6 +404,8 @@ def _pdf_options():
         "no-stop-slow-scripts": "",
         "no-outline": None,
         "no-pdf-compression": "",
+        "javascript-delay": "200",
+        "image-quality": "80", # Reduce size for 150 pages
     }
 
 
@@ -424,6 +463,7 @@ def download_wiki_pdf(page_name=None, route=None):
     )
 
     # ── 2. Build ordered group → pages structure ──────────────────────────────
+    start_build = time.time()
     groups = []   # [{"label": str, "pages": [{"title":, "content_html":}]}]
 
     if not wiki_group_item:
@@ -460,6 +500,8 @@ def download_wiki_pdf(page_name=None, route=None):
             content_html = _clean_for_pdf(_md_to_html(p.content or ""))
             groups[-1]["pages"].append({"title": p.title, "content_html": content_html})
 
+    duration_build = time.time() - start_build
+    
     # ── 3. Build HTML body ────────────────────────────────────────────────────
     body_parts = []
     first_block = True
@@ -488,7 +530,9 @@ def download_wiki_pdf(page_name=None, route=None):
         body_parts.append(g_html)
         first_block = False
 
+    start_wrap = time.time()
     html = _wrap("\n".join(body_parts))
+    duration_wrap = time.time() - start_wrap
 
     # ── 4. Filename ───────────────────────────────────────────────────────────
     if wiki_group_item and frappe.db.exists("Wiki Space", wiki_group_item.parent):
@@ -501,7 +545,26 @@ def download_wiki_pdf(page_name=None, route=None):
         filename = f"{filename}.pdf"
 
     # ── 5. Render PDF ─────────────────────────────────────────────────────────
-    frappe.local.response.filecontent = get_pdf(html, options=_pdf_options())
+    start_render = time.time()
+    
+    # Bypass frappe.get_pdf to ensure local-file-access is NOT disabled by Frappe's wrapper
+    try:
+        pdf_content = pdfkit.from_string(html, options=_pdf_options() or {})
+    except Exception as e:
+        frappe.logger("wiki_pdf").error(f"PDFKit Error: {str(e)}")
+        # Fallback to Frappe's wrapper if direct call fails
+        pdf_content = get_pdf(html, options=_pdf_options())
+        
+    duration_render = time.time() - start_render
+    
+    frappe.logger("wiki_pdf").debug(
+        f"PDF Stats: build={duration_build:.2f}s, wrap/inline={duration_wrap:.2f}s, render={duration_render:.2f}s, html_size={len(html)/1024:.1f}KB"
+    )
+
+    if not pdf_content:
+        frappe.throw(_("Generated PDF is empty. Please check the content for errors."))
+
+    frappe.local.response.filecontent = pdf_content
     frappe.local.response.filename = filename
     frappe.local.response.type = "pdf"
 
@@ -538,7 +601,14 @@ def download_full_wiki_space(wiki_space):
 
     html = _wrap("\n".join(body_parts))
 
-    pdf = get_pdf(html, options=_pdf_options())
+    try:
+        pdf = pdfkit.from_string(html, options=_pdf_options() or {})
+    except Exception as e:
+        frappe.logger("wiki_pdf").error(f"PDFKit Error in Space Download: {str(e)}")
+        pdf = get_pdf(html, options=_pdf_options())
+
+    if not pdf:
+        frappe.throw(_("Generated PDF is empty for this space."))
 
     space_doc = frappe.db.get_value("Wiki Space", {"route": wiki_space}, ["space_name"], as_dict=True)
     filename = (space_doc.space_name if space_doc else None) or root.title or wiki_space
