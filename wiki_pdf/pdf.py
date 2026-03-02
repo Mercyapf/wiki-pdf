@@ -1,6 +1,5 @@
 import frappe
 from frappe.utils.pdf import get_pdf
-import pdfkit
 from frappe import _
 import re
 import markdown2
@@ -9,9 +8,12 @@ import mimetypes
 import os
 from bs4 import BeautifulSoup
 from frappe.core.doctype.file.utils import find_file_by_url
+<<<<<<< HEAD
 import time
 import requests
 from urllib.parse import urlparse
+=======
+>>>>>>> 7caa5e2 (Fix: PDF Download)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -159,6 +161,7 @@ def _clean_for_pdf(html):
 
 def _inline_all_images(html):
     """
+<<<<<<< HEAD
     No-Network Guarantee:
     1. Resolve local files to absolute disk paths (fastest, keeps memory low).
     2. Fetch and Base64 remote images so wkhtmltopdf never needs to go online.
@@ -184,11 +187,24 @@ def _inline_all_images(html):
             continue
 
         if src.startswith("data:"):
+=======
+    Universal Base64 Inliner:
+    - Converts all local and remote images to Base64.
+    - Uses 1x1 transparent fallback for failed images to prevent PDF crashes.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    images_found = False
+    
+    for img in soup.find_all("img"):
+        src = img.get("src")
+        if not src or src.startswith("data:"):
+>>>>>>> 7caa5e2 (Fix: PDF Download)
             continue
 
         try:
             resolved = None
             
+<<<<<<< HEAD
             # ── A. Handle Local Paths (/files/...) ──
             path = src
             is_local = False
@@ -208,10 +224,33 @@ def _inline_all_images(html):
             if not resolved and not is_local:
                 try:
                     resp = requests.get(src, timeout=5)
+=======
+            # Use Frappe's file utility to find the file
+            # This handles both local paths and some relative URLs
+            path = src
+            if "://" in src:
+                from urllib.parse import urlparse
+                path = urlparse(src).path
+
+            file_doc = find_file_by_url(path)
+            if file_doc:
+                content = file_doc.get_content()
+                if content:
+                    mime_type = mimetypes.guess_type(path)[0] or "image/png"
+                    b64_data = base64.b64encode(content).decode("utf-8")
+                    resolved = f"data:{mime_type};base64,{b64_data}"
+
+            # If still not resolved and it's a full URL, try simple fetch
+            if not resolved and "://" in src:
+                try:
+                    import requests
+                    resp = requests.get(src, timeout=3)
+>>>>>>> 7caa5e2 (Fix: PDF Download)
                     if resp.status_code == 200:
                         mime = resp.headers.get("Content-Type", "image/png")
                         b64 = base64.b64encode(resp.content).decode("utf-8")
                         resolved = f"data:{mime};base64,{b64}"
+<<<<<<< HEAD
                         stats["remote"] += 1
                 except:
                     pass
@@ -231,6 +270,17 @@ def _inline_all_images(html):
             # Absolute last resort: just hide it
             img["src"] = EMPTY_IMAGE
             frappe.logger("wiki_pdf").error(f"Image Inliner Failed on {src}: {str(e)}")
+=======
+                except:
+                    pass
+
+            img["src"] = resolved or EMPTY_IMAGE
+            images_found = True
+
+        except Exception as e:
+            img["src"] = EMPTY_IMAGE
+            frappe.logger("wiki_pdf").error(f"Image Inliner Error: {str(e)}")
+>>>>>>> 7caa5e2 (Fix: PDF Download)
 
     # Stripping tags that trigger network or JS
     for tag in soup(["script", "link", "iframe", "audio", "video"]):
@@ -462,7 +512,6 @@ def download_wiki_pdf(page_name=None, route=None):
     )
 
     # ── 2. Build ordered group → pages structure ──────────────────────────────
-    start_build = time.time()
     groups = []   # [{"label": str, "pages": [{"title":, "content_html":}]}]
 
     if not wiki_group_item:
@@ -498,8 +547,6 @@ def download_wiki_pdf(page_name=None, route=None):
 
             content_html = _clean_for_pdf(_md_to_html(p.content or ""))
             groups[-1]["pages"].append({"title": p.title, "content_html": content_html})
-
-    duration_build = time.time() - start_build
     
     # ── 3. Build HTML body ────────────────────────────────────────────────────
     body_parts = []
@@ -529,9 +576,7 @@ def download_wiki_pdf(page_name=None, route=None):
         body_parts.append(g_html)
         first_block = False
 
-    start_wrap = time.time()
     html = _wrap("\n".join(body_parts))
-    duration_wrap = time.time() - start_wrap
 
     # ── 4. Filename ───────────────────────────────────────────────────────────
     if wiki_group_item and frappe.db.exists("Wiki Space", wiki_group_item.parent):
@@ -544,6 +589,7 @@ def download_wiki_pdf(page_name=None, route=None):
         filename = f"{filename}.pdf"
 
     # ── 5. Render PDF ─────────────────────────────────────────────────────────
+<<<<<<< HEAD
     start_render = time.time()
     
     # Direct PDFKit call – No-Network Guarantee makes this safe.
@@ -553,6 +599,9 @@ def download_wiki_pdf(page_name=None, route=None):
     frappe.logger("wiki_pdf").debug(
         f"PDF Stats: build={duration_build:.2f}s, wrap/inline={duration_wrap:.2f}s, render={duration_render:.2f}s, html_size={len(html)/1024:.1f}KB"
     )
+=======
+    pdf_content = get_pdf(html, options=_pdf_options())
+>>>>>>> 7caa5e2 (Fix: PDF Download)
 
     if not pdf_content:
         frappe.throw(_("Generated PDF is empty. Please check the content for errors."))
@@ -593,8 +642,12 @@ def download_full_wiki_space(wiki_space):
         )
 
     html = _wrap("\n".join(body_parts))
+<<<<<<< HEAD
 
     pdf = pdfkit.from_string(html, options=_pdf_options() or {})
+=======
+    pdf = get_pdf(html, options=_pdf_options())
+>>>>>>> 7caa5e2 (Fix: PDF Download)
 
     if not pdf:
         frappe.throw(_("Generated PDF is empty for this space."))
