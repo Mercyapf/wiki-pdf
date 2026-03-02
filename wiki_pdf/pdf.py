@@ -5,6 +5,7 @@ import re
 import markdown2
 import os
 import time
+import tempfile
 import pdfkit
 from bs4 import BeautifulSoup
 
@@ -18,9 +19,7 @@ _MD_EXTRAS = [
     "fenced-code-blocks",
     "strike",
     "cuddled-lists",
-    # NOTE: "break-on-newline" is intentionally excluded.
-    # It converts every '\n' to <br>, which turns blank lines inside
-    # blockquotes / paragraphs into large empty spaces in the PDF.
+    "break-on-newline",   # needed so list items (i. ii. iii.) each appear on their own line
     "header-ids",
     "footnotes",
 ]
@@ -121,17 +120,55 @@ def _split_tables(html, max_rows=15):
     return html
 
 
+def _trim_blockquotes(soup):
+    """
+    Use BeautifulSoup to walk every <blockquote> and strip trailing
+    whitespace/br/empty-p nodes from its end.  This is the reliable fix for
+    the large blank gap that appears at the bottom of blockquote boxes in the PDF.
+
+    Also collapses runs of 3+ sibling <br> tags inside blockquotes to a single <br>.
+    """
+    from bs4 import NavigableString, Tag
+
+    def _is_blank(node):
+        """Return True if `node` contributes nothing visible."""
+        if isinstance(node, NavigableString):
+            return node.strip() == ""
+        if isinstance(node, Tag):
+            if node.name == "br":
+                return True
+            if node.name in ("p", "div", "span"):
+                return node.get_text(strip=True) == "" and not node.find("img")
+        return False
+
+    for bq in soup.find_all("blockquote"):
+        # Strip trailing blank nodes
+        children = list(bq.children)
+        while children and _is_blank(children[-1]):
+            children[-1].extract()
+            children = list(bq.children)
+
+        # Collapse runs of 3+ consecutive <br> siblings to one <br>
+        children = list(bq.children)
+        run = []
+        for child in children:
+            if isinstance(child, Tag) and child.name == "br":
+                run.append(child)
+            else:
+                if len(run) > 2:          # keep at most 2 br's (= 1 blank line)
+                    for extra in run[1:]:
+                        extra.extract()
+                run = []
+        if len(run) > 2:
+            for extra in run[1:]:
+                extra.extract()
+
+    return soup
+
+
 def _strip_blank_nodes(html):
-    """
-    Remove visual empty space left by:
-      - Consecutive <br> tags  (max 1 allowed in a row)
-      - Empty <p> / <p>&nbsp;</p> / whitespace-only <p> tags
-      - Sequences of \\n<br>\\n inside blockquotes
-    This is the main fix for the large blank gaps inside blockquote boxes.
-    """
-    # Collapse 2+ consecutive <br> tags (with optional whitespace between) to a single <br>
-    html = re.sub(r'(<br\s*/?>\s*){2,}', '<br>', html, flags=re.IGNORECASE)
-    # Remove completely empty <p> tags (including those with only whitespace or &nbsp;)
+    """Thin wrapper kept for call-site compatibility; real work done in _trim_blockquotes."""
+    # Also remove any top-level empty <p> tags
     html = re.sub(r'<p[^>]*>\s*(&nbsp;)?\s*</p>', '', html, flags=re.IGNORECASE)
     return html
 
@@ -171,14 +208,14 @@ def _clean_for_pdf(html):
 
 def _prepare_html_for_pdf(html):
     """
-    Minimal HTML cleanup before sending to wkhtmltopdf.
-    - Strips <script> and external <link> tags (not needed / can cause hangs).
-    - Leaves ALL <img> tags completely untouched.
-    - wkhtmltopdf handles image loading natively via --enable-local-file-access.
+    HTML cleanup before sending to wkhtmltopdf:
+    - Strips <script> and external <link> tags.
+    - Trims trailing blank nodes from every <blockquote> (fixes empty space at bottom of boxes).
     """
     soup = BeautifulSoup(html, "html.parser")
     for tag in soup(["script", "link"]):
         tag.decompose()
+    _trim_blockquotes(soup)   # ← removes trailing br/empty-p from blockquotes
     return str(soup)
 
 
@@ -273,17 +310,11 @@ blockquote {
     background: #f7f7f7;
     margin: 6pt 0;
     padding: 6pt 12pt;
-    /* page-break-inside:avoid removed — it causes large blank gaps when the
-       blockquote is taller than the remaining page space */
 }
 
-/* Tighten paragraph spacing INSIDE blockquotes so blank lines don't create large gaps */
+/* Tighten paragraph spacing INSIDE blockquotes */
 blockquote p {
     margin: 1pt 0;
-}
-
-blockquote br {
-    display: none;  /* suppress any residual <br> inside blockquotes */
 }
 
 /* ── Tables ── */
@@ -349,16 +380,16 @@ def _pdf_options():
         "footer-font-name": "Georgia",
         "footer-font-size": "10",
         "footer-spacing": "5",
-        # Prevent wkhtmltopdf from aborting on network errors in cloud/server environments
+        # Prevent wkhtmltopdf from aborting on network errors
         "load-error-handling": "ignore",
         "load-media-error-handling": "ignore",
         "disable-javascript": "",
         "no-stop-slow-scripts": "",
         "no-outline": None,
         # NOTE: do NOT add "no-pdf-compression" — it bloats the file to 100MB+
-        "javascript-delay": "200",
-        "image-quality": "60",   # Compress images more (was 80)
-        "image-dpi": "150",      # Cap image resolution (screen-quality is fine for PDF)
+        # NOTE: no "javascript-delay" — JS is disabled so waiting is pointless
+        "image-quality": "60",
+        "image-dpi": "150",
     }
 
 
@@ -497,21 +528,28 @@ def download_wiki_pdf(page_name=None, route=None):
     if not str(filename).lower().endswith(".pdf"):
         filename = f"{filename}.pdf"
 
-    # ── 5. Render PDF ─────────────────────────────────────────────────────────
+    # ── 5. Render PDF via temp file (faster than from_string for large docs) ────
     start_render = time.time()
-    # Using pdfkit directly for maximum performance control on 200+ pages
     config = getattr(frappe.local, "pdfkit_config", None)
+    pdf_content = None
+    tmp_html = None
     try:
-        pdf_content = pdfkit.from_string(html, output_path=False, options=_pdf_options() or {}, configuration=config)
+        with tempfile.NamedTemporaryFile(suffix=".html", delete=False, mode="w", encoding="utf-8") as f:
+            f.write(html)
+            tmp_html = f.name
+        pdf_content = pdfkit.from_file(tmp_html, output_path=False, options=_pdf_options(), configuration=config)
     except Exception as e:
-        frappe.logger("wiki_pdf").error(f"Direct Render Error: {str(e)} | Falling back to get_pdf")
-        # Fallback to get_pdf which handles config itself
+        frappe.logger("wiki_pdf").error(f"Render Error: {str(e)} | Falling back to get_pdf")
         pdf_content = get_pdf(html, options=_pdf_options())
+    finally:
+        if tmp_html and os.path.exists(tmp_html):
+            os.unlink(tmp_html)
 
     duration_render = time.time() - start_render
-    
+
     frappe.logger("wiki_pdf").debug(
-        f"PDF Stats: pages={sum(len(g['pages']) for g in groups)}, build={duration_build:.2f}s, wrap={duration_wrap:.2f}s, render={duration_render:.2f}s, size={len(html)/1024:.1f}KB"
+        f"PDF Stats: pages={sum(len(g['pages']) for g in groups)}, build={duration_build:.2f}s, "
+        f"wrap={duration_wrap:.2f}s, render={duration_render:.2f}s, size={len(html)/1024:.1f}KB"
     )
 
     if not pdf_content:
@@ -519,7 +557,7 @@ def download_wiki_pdf(page_name=None, route=None):
 
     frappe.local.response.filecontent = pdf_content
     frappe.local.response.filename = filename
-    frappe.local.response.type = "download"  # "download" → Content-Disposition: attachment (saves file)
+    frappe.local.response.type = "download"
     frappe.local.response.content_type = "application/pdf"
 
 
@@ -580,19 +618,27 @@ def download_full_wiki_space(wiki_space):
     html = _wrap("\n".join(body_parts))
     duration_wrap = time.time() - start_wrap
 
-    # ── 5. Render PDF ─────────────────────────────────────────────────────────
+    # ── 5. Render PDF via temp file ────────────────────────────────────────────
     start_render = time.time()
     config = getattr(frappe.local, "pdfkit_config", None)
+    pdf = None
+    tmp_html = None
     try:
-        pdf = pdfkit.from_string(html, output_path=False, options=_pdf_options() or {}, configuration=config)
+        with tempfile.NamedTemporaryFile(suffix=".html", delete=False, mode="w", encoding="utf-8") as f:
+            f.write(html)
+            tmp_html = f.name
+        pdf = pdfkit.from_file(tmp_html, output_path=False, options=_pdf_options(), configuration=config)
     except Exception as e:
         frappe.logger("wiki_pdf").error(f"Space Render Error: {str(e)} | Falling back to get_pdf")
         pdf = get_pdf(html, options=_pdf_options())
+    finally:
+        if tmp_html and os.path.exists(tmp_html):
+            os.unlink(tmp_html)
 
     duration_render = time.time() - start_render
-    
+
     frappe.logger("wiki_pdf").debug(
-        f"PDF Space Stats: pages={len(sidebar_items)}, build={0:.2f}s, wrap={duration_wrap:.2f}s, render={duration_render:.2f}s"
+        f"PDF Space Stats: pages={len(sidebar_items)}, wrap={duration_wrap:.2f}s, render={duration_render:.2f}s"
     )
 
     if not pdf:
