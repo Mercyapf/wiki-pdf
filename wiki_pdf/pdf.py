@@ -404,7 +404,7 @@ def _pdf_options():
         "no-stop-slow-scripts": "",
         "no-outline": None,
         "no-pdf-compression": "",
-        "javascript-delay": "10",
+        "javascript-delay": "15",
         "image-quality": "80", # Reduce size for 150 pages
     }
 
