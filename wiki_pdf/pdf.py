@@ -3,15 +3,10 @@ from frappe.utils.pdf import get_pdf
 from frappe import _
 import re
 import markdown2
-import base64
-import mimetypes
 import os
 import time
-import requests
 import pdfkit
-from urllib.parse import urlparse
 from bs4 import BeautifulSoup
-from frappe.core.doctype.file.utils import find_file_by_url
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -27,9 +22,6 @@ _MD_EXTRAS = [
     "header-ids",
     "footnotes",
 ]
-
-# 1x1 transparent PNG
-EMPTY_IMAGE = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
 
 
 def _md_to_html(text):
@@ -157,70 +149,16 @@ def _clean_for_pdf(html):
     return html
 
 
-def _inline_all_images(html):
+def _prepare_html_for_pdf(html):
     """
-    Optimized Image Resolver:
-    1. Resolve local files to absolute disk paths (extremely fast for 200+ pages).
-    2. Base64 only used for remote images (fallback).
-    3. 1x1 transparent fallback for failed images to prevent PDF creation errors.
+    Minimal HTML cleanup before sending to wkhtmltopdf.
+    - Strips <script> and external <link> tags (not needed / can cause hangs).
+    - Leaves ALL <img> tags completely untouched.
+    - wkhtmltopdf handles image loading natively via --enable-local-file-access.
     """
     soup = BeautifulSoup(html, "html.parser")
-    cache = {} 
-    
-    for img in soup.find_all("img"):
-        src = img.get("src")
-        if not src or src.startswith("data:"):
-            continue
-
-        if src in cache:
-            img["src"] = cache[src]
-            continue
-
-        try:
-            resolved = None
-            
-            # --- 1. Local Path Resolution ---
-            path = src
-            if "://" in src:
-                # Handle full local URLs by extracting path
-                if src.startswith(frappe.get_url()):
-                    path = urlparse(src).path
-                else:
-                    path = None # It's actually remote
-
-            if path:
-                file_doc = find_file_by_url(path)
-                if file_doc:
-                    full_path = file_doc.get_full_path()
-                    if full_path and os.path.exists(full_path):
-                        # Passing absolute disk path is fastest for wkhtmltopdf
-                        resolved = os.path.abspath(full_path)
-
-            # --- 2. Remote Fetching (Fallback) ---
-            if not resolved and "://" in src:
-                try:
-                    resp = requests.get(src, timeout=3)
-                    if resp.status_code == 200:
-                        mime = resp.headers.get("Content-Type", "image/png")
-                        b64 = base64.b64encode(resp.content).decode("utf-8")
-                        resolved = f"data:{mime};base64,{b64}"
-                except:
-                    pass
-
-            # --- 3. Final Fallback ---
-            img["src"] = resolved or EMPTY_IMAGE
-            cache[src] = img["src"]
-
-        except Exception as e:
-            img["src"] = EMPTY_IMAGE
-            frappe.logger("wiki_pdf").error(f"Image Resolution Error: {str(e)}")
-
-    # Stripping tags that trigger network or JS (re-evaluating)
-    # We strip <script> but keep others if we want dynamic content, 
-    # but for PDF stability we strip the heavy ones.
     for tag in soup(["script", "link"]):
         tag.decompose()
-
     return str(soup)
 
 
@@ -402,7 +340,7 @@ def _wrap(body):
 </head>
 <body>{body}</body>
 </html>"""
-    return _inline_all_images(html)
+    return _prepare_html_for_pdf(html)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -550,7 +488,8 @@ def download_wiki_pdf(page_name=None, route=None):
 
     frappe.local.response.filecontent = pdf_content
     frappe.local.response.filename = filename
-    frappe.local.response.type = "pdf"
+    frappe.local.response.type = "download"  # "download" → Content-Disposition: attachment (saves file)
+    frappe.local.response.content_type = "application/pdf"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -634,4 +573,5 @@ def download_full_wiki_space(wiki_space):
 
     frappe.local.response.filename = filename
     frappe.local.response.filecontent = pdf
-    frappe.local.response.type = "pdf"
+    frappe.local.response.type = "download"  # "download" → Content-Disposition: attachment (saves file)
+    frappe.local.response.content_type = "application/pdf"

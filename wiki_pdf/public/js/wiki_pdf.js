@@ -7,36 +7,18 @@ frappe.ready(function () {
 });
 
 function add_download_pdf_button() {
-    var $btn = $('#btn-download-wiki-pdf');
-
-    // Get the current route
-    var current_route = window.location.pathname.replace(/^\//, '');
-
-    // Strip trailing slash if present
-    if (current_route.endsWith('/')) {
-        current_route = current_route.slice(0, -1);
+    if ($('#btn-download-wiki-pdf').length > 0) {
+        return; // already added
     }
 
-    // Construct the download URL
-    var download_url = "/api/method/wiki_pdf.pdf.download_wiki_pdf?route=" + encodeURIComponent(current_route);
-
-    if ($btn.length > 0) {
-        // If button exists, just update the href (in case of SPA navigation)
-        $btn.attr('href', download_url);
-        return;
-    }
-
-    // Identify the navbar container
     var $navbar = $('.navbar-nav').first();
-    var $container = $navbar.find('.sun-moon-container');
-
     if ($navbar.length === 0) return;
 
-    $btn = $('<a>')
+    var $container = $navbar.find('.sun-moon-container');
+
+    var $btn = $('<a>')
         .attr('id', 'btn-download-wiki-pdf')
-        .attr('href', download_url)
-        .attr('target', '_blank')
-        .attr('rel', 'noopener noreferrer')
+        .attr('href', '#')
         .addClass('navbar-link mr-2 d-print-none')
         .css({
             'white-space': 'nowrap',
@@ -44,6 +26,29 @@ function add_download_pdf_button() {
             'cursor': 'pointer'
         })
         .text('Download PDF');
+
+    $btn.on('click', function (e) {
+        e.preventDefault();
+
+        // Get current route (strip leading slash and trailing slash)
+        var current_route = window.location.pathname.replace(/^\/|\/$/g, '');
+
+        var download_url = '/api/method/wiki_pdf.pdf.download_wiki_pdf?route=' + encodeURIComponent(current_route);
+
+        // Use an invisible iframe to trigger the download without navigating away.
+        // The server sets Content-Disposition: attachment so the browser saves the file.
+        var iframe = document.createElement('iframe');
+        iframe.style.display = 'none';
+        iframe.src = download_url;
+        document.body.appendChild(iframe);
+
+        // Show loading feedback and remove the iframe after a reasonable delay
+        $btn.text('Generating PDF…').css('opacity', '0.6');
+        setTimeout(function () {
+            document.body.removeChild(iframe);
+            $btn.text('Download PDF').css('opacity', '');
+        }, 60000); // 60 seconds max — enough for large PDFs
+    });
 
     if ($container.length > 0) {
         $container.before($btn);
