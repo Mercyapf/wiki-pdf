@@ -531,11 +531,12 @@ def download_wiki_pdf(page_name=None, route=None):
     # ── 5. Render PDF ─────────────────────────────────────────────────────────
     start_render = time.time()
     # Using pdfkit directly for maximum performance control on 200+ pages
+    config = getattr(frappe.local, "pdfkit_config", None)
     try:
-        pdf_content = pdfkit.from_string(html, options=_pdf_options() or {})
+        pdf_content = pdfkit.from_string(html, output_path=False, options=_pdf_options() or {}, configuration=config)
     except Exception as e:
-        frappe.logger("wiki_pdf").error(f"Direct Render Error: {str(e)}")
-        # Fallback to get_pdf
+        frappe.logger("wiki_pdf").error(f"Direct Render Error: {str(e)} | Falling back to get_pdf")
+        # Fallback to get_pdf which handles config itself
         pdf_content = get_pdf(html, options=_pdf_options())
 
     duration_render = time.time() - start_render
@@ -611,10 +612,11 @@ def download_full_wiki_space(wiki_space):
 
     # ── 5. Render PDF ─────────────────────────────────────────────────────────
     start_render = time.time()
+    config = getattr(frappe.local, "pdfkit_config", None)
     try:
-        pdf = pdfkit.from_string(html, options=_pdf_options() or {})
+        pdf = pdfkit.from_string(html, output_path=False, options=_pdf_options() or {}, configuration=config)
     except Exception as e:
-        frappe.logger("wiki_pdf").error(f"Space Render Error: {str(e)}")
+        frappe.logger("wiki_pdf").error(f"Space Render Error: {str(e)} | Falling back to get_pdf")
         pdf = get_pdf(html, options=_pdf_options())
 
     duration_render = time.time() - start_render
