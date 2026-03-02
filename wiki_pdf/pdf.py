@@ -6,6 +6,10 @@ import markdown2
 import base64
 import mimetypes
 import os
+import time
+import requests
+import pdfkit
+from urllib.parse import urlparse
 from bs4 import BeautifulSoup
 from frappe.core.doctype.file.utils import find_file_by_url
 
@@ -155,40 +159,46 @@ def _clean_for_pdf(html):
 
 def _inline_all_images(html):
     """
-    Universal Base64 Inliner:
-    - Converts all local and remote images to Base64.
-    - Uses 1x1 transparent fallback for failed images to prevent PDF crashes.
+    Optimized Image Resolver:
+    1. Resolve local files to absolute disk paths (extremely fast for 200+ pages).
+    2. Base64 only used for remote images (fallback).
+    3. 1x1 transparent fallback for failed images to prevent PDF creation errors.
     """
     soup = BeautifulSoup(html, "html.parser")
-    images_found = False
+    cache = {} 
     
     for img in soup.find_all("img"):
         src = img.get("src")
         if not src or src.startswith("data:"):
             continue
 
+        if src in cache:
+            img["src"] = cache[src]
+            continue
+
         try:
             resolved = None
             
-            # Use Frappe's file utility to find the file
-            # This handles both local paths and some relative URLs
+            # --- 1. Local Path Resolution ---
             path = src
             if "://" in src:
-                from urllib.parse import urlparse
-                path = urlparse(src).path
+                # Handle full local URLs by extracting path
+                if src.startswith(frappe.get_url()):
+                    path = urlparse(src).path
+                else:
+                    path = None # It's actually remote
 
-            file_doc = find_file_by_url(path)
-            if file_doc:
-                content = file_doc.get_content()
-                if content:
-                    mime_type = mimetypes.guess_type(path)[0] or "image/png"
-                    b64_data = base64.b64encode(content).decode("utf-8")
-                    resolved = f"data:{mime_type};base64,{b64_data}"
+            if path:
+                file_doc = find_file_by_url(path)
+                if file_doc:
+                    full_path = file_doc.get_full_path()
+                    if full_path and os.path.exists(full_path):
+                        # Passing absolute disk path is fastest for wkhtmltopdf
+                        resolved = os.path.abspath(full_path)
 
-            # If still not resolved and it's a full URL, try simple fetch
+            # --- 2. Remote Fetching (Fallback) ---
             if not resolved and "://" in src:
                 try:
-                    import requests
                     resp = requests.get(src, timeout=3)
                     if resp.status_code == 200:
                         mime = resp.headers.get("Content-Type", "image/png")
@@ -197,15 +207,18 @@ def _inline_all_images(html):
                 except:
                     pass
 
+            # --- 3. Final Fallback ---
             img["src"] = resolved or EMPTY_IMAGE
-            images_found = True
+            cache[src] = img["src"]
 
         except Exception as e:
             img["src"] = EMPTY_IMAGE
-            frappe.logger("wiki_pdf").error(f"Image Inliner Error: {str(e)}")
+            frappe.logger("wiki_pdf").error(f"Image Resolution Error: {str(e)}")
 
-    # Stripping tags that trigger network or JS
-    for tag in soup(["script", "link", "iframe", "audio", "video"]):
+    # Stripping tags that trigger network or JS (re-evaluating)
+    # We strip <script> but keep others if we want dynamic content, 
+    # but for PDF stability we strip the heavy ones.
+    for tag in soup(["script", "link"]):
         tag.decompose()
 
     return str(soup)
@@ -434,6 +447,7 @@ def download_wiki_pdf(page_name=None, route=None):
     )
 
     # ── 2. Build ordered group → pages structure ──────────────────────────────
+    start_build = time.time()
     groups = []   # [{"label": str, "pages": [{"title":, "content_html":}]}]
 
     if not wiki_group_item:
@@ -469,6 +483,8 @@ def download_wiki_pdf(page_name=None, route=None):
 
             content_html = _clean_for_pdf(_md_to_html(p.content or ""))
             groups[-1]["pages"].append({"title": p.title, "content_html": content_html})
+
+    duration_build = time.time() - start_build
     
     # ── 3. Build HTML body ────────────────────────────────────────────────────
     body_parts = []
@@ -498,7 +514,9 @@ def download_wiki_pdf(page_name=None, route=None):
         body_parts.append(g_html)
         first_block = False
 
+    start_wrap = time.time()
     html = _wrap("\n".join(body_parts))
+    duration_wrap = time.time() - start_wrap
 
     # ── 4. Filename ───────────────────────────────────────────────────────────
     if wiki_group_item and frappe.db.exists("Wiki Space", wiki_group_item.parent):
@@ -511,7 +529,20 @@ def download_wiki_pdf(page_name=None, route=None):
         filename = f"{filename}.pdf"
 
     # ── 5. Render PDF ─────────────────────────────────────────────────────────
-    pdf_content = get_pdf(html, options=_pdf_options())
+    start_render = time.time()
+    # Using pdfkit directly for maximum performance control on 200+ pages
+    try:
+        pdf_content = pdfkit.from_string(html, options=_pdf_options() or {})
+    except Exception as e:
+        frappe.logger("wiki_pdf").error(f"Direct Render Error: {str(e)}")
+        # Fallback to get_pdf
+        pdf_content = get_pdf(html, options=_pdf_options())
+
+    duration_render = time.time() - start_render
+    
+    frappe.logger("wiki_pdf").debug(
+        f"PDF Stats: pages={sum(len(g['pages']) for g in groups)}, build={duration_build:.2f}s, wrap={duration_wrap:.2f}s, render={duration_render:.2f}s, size={len(html)/1024:.1f}KB"
+    )
 
     if not pdf_content:
         frappe.throw(_("Generated PDF is empty. Please check the content for errors."))
@@ -527,38 +558,75 @@ def download_wiki_pdf(page_name=None, route=None):
 
 @frappe.whitelist(allow_guest=True)
 def download_full_wiki_space(wiki_space):
-    """wiki_space = route of the root wiki page, e.g. 'creche-manual'."""
-    root = frappe.get_doc("Wiki Page", {"route": wiki_space})
+    """
+    Download EVERY page in the Wiki Space hierarchy.
+    Instead of just immediate children, we use the Space's sidebar definition 
+    (Wiki Group Items) to ensure total coverage and correct order.
+    """
+    space_doc = frappe.db.get_value("Wiki Space", {"route": wiki_space}, ["name", "space_name"], as_dict=True)
+    if not space_doc:
+        frappe.throw(_("Wiki Space not found: {0}").format(wiki_space))
 
-    all_pages = frappe.get_all(
-        "Wiki Page",
-        filters={"published": 1},
-        fields=["name", "title", "content", "route", "parent_wiki_page", "creation"],
-        order_by="creation asc",
+    # Fetch all sidebar items for this space
+    sidebar_items = frappe.get_all(
+        "Wiki Group Item",
+        filters={"parent": space_doc.name},
+        fields=["wiki_page", "parent_label", "idx"],
+        order_by="idx asc",
     )
 
-    pages = [p for p in all_pages if p.name == root.name or p.parent_wiki_page == root.name]
+    if not sidebar_items:
+        frappe.throw(_("No pages found in this space's sidebar."))
 
-    if not pages:
-        frappe.throw(_("No wiki pages found"))
+    # Bulk fetch content
+    page_names = [item.wiki_page for item in sidebar_items if item.wiki_page]
+    pages_data = frappe.get_all(
+        "Wiki Page",
+        filters={"name": ["in", page_names]},
+        fields=["name", "title", "content"],
+    )
+    pages_map = {row.name: row for row in pages_data}
 
     body_parts = []
+    for i, item in enumerate(sidebar_items):
+        if item.wiki_page not in pages_map:
+            continue
+        p = pages_map[item.wiki_page]
+        
+        pb = "page-break-before: always;" if i > 0 else ""
+        content_html = _clean_for_pdf(_md_to_html(p.content or ""))
+        
+        # Optionally include parent label if it changes
+        label_html = ""
+        if item.parent_label and (i == 0 or sidebar_items[i-1].parent_label != item.parent_label):
+            label_html = f'<h1 class="group-name">{item.parent_label}</h1>'
 
-    for i, page in enumerate(pages):
-        pb = "" if i == 0 else "page-break-before: always;"
-        content_html = _clean_for_pdf(_md_to_html(page.content or ""))
         body_parts.append(
-            f'<div style="{pb}"><h1 class="page-title">{page.title}</h1>{content_html}</div>'
+            f'<div style="{pb}">{label_html}<h1 class="page-title">{p.title}</h1>{content_html}</div>'
         )
 
+    start_wrap = time.time()
     html = _wrap("\n".join(body_parts))
-    pdf = get_pdf(html, options=_pdf_options())
+    duration_wrap = time.time() - start_wrap
+
+    # ── 5. Render PDF ─────────────────────────────────────────────────────────
+    start_render = time.time()
+    try:
+        pdf = pdfkit.from_string(html, options=_pdf_options() or {})
+    except Exception as e:
+        frappe.logger("wiki_pdf").error(f"Space Render Error: {str(e)}")
+        pdf = get_pdf(html, options=_pdf_options())
+
+    duration_render = time.time() - start_render
+    
+    frappe.logger("wiki_pdf").debug(
+        f"PDF Space Stats: pages={len(sidebar_items)}, build={0:.2f}s, wrap={duration_wrap:.2f}s, render={duration_render:.2f}s"
+    )
 
     if not pdf:
         frappe.throw(_("Generated PDF is empty for this space."))
 
-    space_doc = frappe.db.get_value("Wiki Space", {"route": wiki_space}, ["space_name"], as_dict=True)
-    filename = (space_doc.space_name if space_doc else None) or root.title or wiki_space
+    filename = space_doc.space_name or wiki_space
     if not filename.lower().endswith(".pdf"):
         filename += ".pdf"
 
