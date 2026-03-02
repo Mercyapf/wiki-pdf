@@ -302,6 +302,10 @@ def _pdf_options():
         "footer-font-name": "Georgia",
         "footer-font-size": "10",
         "footer-spacing": "5",
+        # Prevent wkhtmltopdf from aborting on network errors in cloud/server environments
+        "load-error-handling": "ignore",
+        "load-media-error-handling": "ignore",
+        "disable-javascript": "",
     }
 
 
