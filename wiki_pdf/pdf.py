@@ -3,6 +3,11 @@ from frappe.utils.pdf import get_pdf
 from frappe import _
 import re
 import markdown2
+import base64
+import mimetypes
+import os
+from bs4 import BeautifulSoup
+from frappe.core.doctype.file.utils import find_file_by_url
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -143,6 +148,59 @@ def _clean_for_pdf(html):
     # Split large tables → multiple sub-tables so page-break-inside:avoid works
     html = _split_tables(html)
     return html
+
+
+def _inline_all_images(html):
+    """
+    Find all local images in the HTML and convert them to base64 strings.
+    This avoids wkhtmltopdf making network requests to the site itself.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    images_found = False
+
+    for img in soup.find_all("img"):
+        src = img.get("src")
+        if not src:
+            continue
+
+        # Skip already base64 encoded images
+        if src.startswith("data:"):
+            continue
+
+        try:
+            # Handle local paths (/files/...) or absolute paths with current host
+            path = src
+            if "://" in src:
+                from urllib.parse import urlparse
+                parsed = urlparse(src)
+                # If it's the same host or we want to be aggressive, we treat it as local
+                # For now, let's just take the path part if it's on the same site
+                if parsed.netloc == frappe.utils.get_host_name():
+                    path = parsed.path
+                else:
+                    # External image: wkhtmltopdf will try to fetch it.
+                    # We could try to fetch it here and base64 it too, but let's start with local.
+                    continue
+
+            # Find the file in Frappe
+            file_doc = find_file_by_url(path)
+            if not file_doc:
+                continue
+
+            content = file_doc.get_content()
+            if not content:
+                continue
+
+            mime_type = mimetypes.guess_type(path)[0] or "image/png"
+            b64_data = base64.b64encode(content).decode("utf-8")
+            img["src"] = f"data:{mime_type};base64,{b64_data}"
+            images_found = True
+
+        except Exception as e:
+            # Log error but don't crash the whole PDF generation
+            frappe.logger().error(f"Failed to inline image {src}: {str(e)}")
+
+    return str(soup) if images_found else html
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -306,11 +364,14 @@ def _pdf_options():
         "load-error-handling": "ignore",
         "load-media-error-handling": "ignore",
         "disable-javascript": "",
+        "no-stop-slow-scripts": "",
+        "no-outline": None,
+        "no-pdf-compression": "",
     }
 
 
 def _wrap(body):
-    return f"""<!DOCTYPE html>
+    html = f"""<!DOCTYPE html>
 <html>
 <head>
 <meta charset="UTF-8">
@@ -318,6 +379,7 @@ def _wrap(body):
 </head>
 <body>{body}</body>
 </html>"""
+    return _inline_all_images(html)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
