@@ -7,7 +7,7 @@ import re
 import tempfile
 from bs4 import BeautifulSoup
 from frappe.core.doctype.file.utils import find_file_by_url
-from urllib.parse import urlparse
+from urllib.parse import urlparse, unquote
 from frappe import _
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -45,18 +45,21 @@ def _inline_images(html):
         fallback = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
         
         try:
-            if src.startswith("/files/"):
+            # Handle encoded URLs (spaces, etc.)
+            real_src = unquote(src)
+            
+            if real_src.startswith("/files/"):
                 # Handle standard Frappe /files/ path
-                path = frappe.get_site_path("public", "files", src.split("/")[-1])
+                path = frappe.get_site_path("public", "files", real_src.split("/")[-1])
                 if os.path.exists(path):
                     img["src"] = os.path.abspath(path)
                     continue
 
             # Fallback to inlining if it's a URL or if path resolution failed
-            path = src
-            if "://" not in src or src.startswith(frappe.utils.get_url()):
+            path = real_src
+            if "://" not in real_src or real_src.startswith(frappe.utils.get_url()):
                 # Resolve relative or same-site URL
-                path = urlparse(src).path
+                path = urlparse(real_src).path
                 file_doc = find_file_by_url(path)
                 if file_doc and os.path.exists(file_doc.get_full_path()):
                     img["src"] = os.path.abspath(file_doc.get_full_path())
@@ -166,7 +169,7 @@ def _pdf_options(footer_path):
     return {
         "page-size": "A4", "margin-top": "15mm", "margin-bottom": "18mm", "margin-left": "18mm", "margin-right": "18mm",
         "encoding": "UTF-8", "quiet": "", "enable-local-file-access": "", "footer-html": footer_path, "footer-spacing": "5",
-        "load-error-handling": "ignore", "load-media-error-handling": "ignore"
+        "load-error-handling": "ignore", "load-media-error-handling": "ignore", "disable-smart-shrinking": ""
     }
 
 def _wrap(body):
@@ -190,9 +193,9 @@ def download_wiki_pdf(page_name=None, route=None):
         if not wiki_group_item:
             groups.append({"label": None, "pages": [{"title": page_doc.title, "content_html": _clean_for_pdf(_md_to_html(page_doc.content or ""))}]})
         else:
-            sidebar = frappe.get_all("Wiki Group Item", filters={"parent": wiki_group_item.parent}, fields=["wiki_page", "parent_label"], order_by="idx asc", ignore_permissions=True)
+            sidebar = frappe.get_all("Wiki Group Item", filters={"parent": wiki_group_item.parent}, fields=["wiki_page", "parent_label"], order_by="idx asc", ignore_permissions=True, limit=0)
             p_names = [s.wiki_page for s in sidebar if s.wiki_page]
-            p_map = {p.name: p for p in frappe.get_all("Wiki Page", filters={"name": ["in", p_names]}, fields=["name", "title", "content"], ignore_permissions=True)}
+            p_map = {p.name: p for p in frappe.get_all("Wiki Page", filters={"name": ["in", p_names]}, fields=["name", "title", "content"], ignore_permissions=True, limit=0)}
             
             for s in sidebar:
                 if s.wiki_page in p_map:
@@ -263,7 +266,7 @@ def download_full_wiki_space(wiki_space):
         except: pass
 
         # Pages
-        all_pages = frappe.get_all("Wiki Page", filters={"published": 1}, fields=["name", "title", "content", "parent_wiki_page"], order_by="creation asc", ignore_permissions=True)
+        all_pages = frappe.get_all("Wiki Page", filters={"published": 1}, fields=["name", "title", "content", "parent_wiki_page"], order_by="creation asc", ignore_permissions=True, limit=0)
         pages = [p for p in all_pages if p.name == root_name or p.parent_wiki_page == root_name]
         
         body_parts = []
