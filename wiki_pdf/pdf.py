@@ -40,15 +40,33 @@ def _inline_images(html):
     for img in soup.find_all("img"):
         src = img.get("src")
         if not src or src.startswith("data:"): continue
+        
+        # 1x1 transparent pixel fallback
+        fallback = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+        
         try:
+            if src.startswith("/files/"):
+                # Handle standard Frappe /files/ path
+                path = frappe.get_site_path("public", "files", src.split("/")[-1])
+                if os.path.exists(path):
+                    img["src"] = os.path.abspath(path)
+                    continue
+
+            # Fallback to inlining if it's a URL or if path resolution failed
             path = src
             if "://" not in src or src.startswith(frappe.utils.get_url()):
+                # Resolve relative or same-site URL
                 path = urlparse(src).path
                 file_doc = find_file_by_url(path)
                 if file_doc and os.path.exists(file_doc.get_full_path()):
                     img["src"] = os.path.abspath(file_doc.get_full_path())
+                else:
+                    img["src"] = fallback
+            else:
+                # External images: keep as is but wkhtmltopdf might fail without network
+                pass
         except Exception:
-            img["src"] = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+            img["src"] = fallback
     return str(soup)
 
 def _split_tables(html, max_rows=15):
@@ -148,6 +166,7 @@ def _pdf_options(footer_path):
     return {
         "page-size": "A4", "margin-top": "15mm", "margin-bottom": "18mm", "margin-left": "18mm", "margin-right": "18mm",
         "encoding": "UTF-8", "quiet": "", "enable-local-file-access": "", "footer-html": footer_path, "footer-spacing": "5",
+        "load-error-handling": "ignore", "load-media-error-handling": "ignore"
     }
 
 def _wrap(body):
@@ -226,20 +245,36 @@ def download_full_wiki_space(wiki_space):
             for pos in ["front", "back"]:
                 ctype = getattr(settings, f"{pos}_cover_type")
                 if ctype == "Standard":
-                    covers[pos] = f'<h1 style="text-align:center;padding-top:40%;font-size:48pt;">{wiki_space}</h1>'
+                    if pos == "front":
+                        covers[pos] = f'<h1 style="text-align:center;padding-top:40%;font-size:48pt;">{wiki_space}</h1>'
+                    else:
+                        path = frappe.get_app_path("wiki_pdf", "public", "images", "back_cover.jpg")
+                        if os.path.exists(path):
+                            covers[pos] = f'<div style="width:100%;height:1100px;background-image:url(\'file://{os.path.abspath(path)}\');background-size:cover;background-position:center;"></div>'
                 elif ctype == "Custom HTML":
                     covers[pos] = getattr(settings, f"{pos}_cover_html")
+                elif ctype == "Image":
+                    img_url = getattr(settings, f"{pos}_cover_image")
+                    if img_url:
+                        if img_url.startswith("/files/"):
+                            path = frappe.get_site_path("public", "files", img_url.split("/")[-1])
+                            if os.path.exists(path):
+                                covers[pos] = f'<div style="width:100%;height:1100px;background-image:url(\'file://{os.path.abspath(path)}\');background-size:cover;background-position:center;"></div>'
         except: pass
 
         # Pages
         all_pages = frappe.get_all("Wiki Page", filters={"published": 1}, fields=["name", "title", "content", "parent_wiki_page"], order_by="creation asc", ignore_permissions=True)
         pages = [p for p in all_pages if p.name == root_name or p.parent_wiki_page == root_name]
         
-        body_parts = [f'<div style="page-break-after:always;">{covers["front"]}</div>'] if covers["front"] else []
+        body_parts = []
+        if covers["front"]:
+            body_parts.append(f'<div style="page-break-after:always;">{covers["front"]}</div>')
+        
         for i, p in enumerate(pages):
             pb = "page-break-before:always;" if (i > 0 or covers["front"]) else ""
             html = _clean_for_pdf(_md_to_html(p.content or ""))
             body_parts.append(f'<div style="{pb}"><h1 class="page-title">{p.title}</h1>{html}</div>')
+        
         if covers["back"]: 
             body_parts.append(f'<div style="page-break-before:always;">{covers["back"]}</div>')
 
