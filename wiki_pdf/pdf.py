@@ -72,7 +72,7 @@ def _inline_images(html):
             img["src"] = fallback
     return str(soup)
 
-def _split_tables(html, max_rows=15):
+def _split_tables(html, max_rows=25):
     """Splits large tables into groups of `max_rows` rows so page-break-inside:avoid works."""
     def _get_thead(table_html):
         m = re.search(r'(<thead[^>]*>.*?</thead>)', table_html, re.DOTALL | re.IGNORECASE)
@@ -89,7 +89,8 @@ def _split_tables(html, max_rows=15):
         src = tbody.group(1) if tbody else table_html
         return re.findall(r'<tr[^>]*>.*?</tr>', src, re.DOTALL | re.IGNORECASE)
 
-    TABLE_STYLE = 'width:100%;border-collapse:collapse;table-layout:fixed;font-size:10pt;margin:0;page-break-inside:avoid;'
+    # Force each chunk to stay on one page if possible (Atomic Chunks)
+    TABLE_STYLE = 'width:100%;border-collapse:collapse;table-layout:fixed;font-size:10pt;margin:0;page-break-inside:avoid !important;'
 
     def process_table(match):
         table_html = match.group(0)
@@ -131,13 +132,14 @@ def _clean_for_pdf(html):
 PDF_CSS = """
 @page { size: A4; margin: 15mm 18mm; }
 body { font-family: Georgia, serif; font-size: 11pt; line-height: 1.4; color: #111; margin: 0; padding: 0; }
-h1.group-name { font-size: 20pt; font-weight: bold; border-bottom: 2px solid #333; padding-bottom: 4pt; margin-bottom: 14pt; page-break-after: avoid; }
-h1.page-title { color: #1a52a0; font-size: 16pt; font-weight: bold; margin-bottom: 12pt; page-break-after: avoid; }
-h1, h2, h3, h4 { color: #222; margin-top: 14pt; margin-bottom: 6pt; page-break-after: avoid; }
+h1.group-name { font-size: 20pt; font-weight: bold; border-bottom: 2px solid #333; padding-bottom: 4pt; margin-bottom: 14pt; page-break-after: avoid !important; }
+h1.page-title { color: #1a52a0; font-size: 16pt; font-weight: bold; margin-bottom: 12pt; page-break-after: avoid !important; }
+h1, h2, h3, h4 { color: #222; margin-top: 14pt; margin-bottom: 6pt; page-break-after: avoid !important; }
 p { margin: 4pt 0; }
 img { max-width: 100%; height: auto; display: block; margin: 8pt 0; }
-table { width: 100%; border-collapse: collapse; margin: 8pt 0; table-layout: fixed; font-size: 10pt; }
-thead { display: table-header-group; }
+table { width: 100%; border-collapse: collapse; margin: 8pt 0; table-layout: fixed; font-size: 10pt; page-break-inside: auto; }
+thead { display: table-header-group !important; }
+tr { page-break-inside: avoid; }
 th, td { border: 1px solid #aaa; padding: 4pt 6pt; vertical-align: top; word-break: break-word; line-height: 1.2; }
 th { background-color: #eee; font-weight: bold; text-align: left; }
 blockquote { border: 1px solid #bbb; border-left: 4pt solid #555; background: #f7f7f7; padding: 8pt 14pt; margin: 8pt 0; page-break-inside: avoid; }

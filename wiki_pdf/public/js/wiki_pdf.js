@@ -35,21 +35,23 @@ function setup_wiki_pdf_download() {
 
         var original_text = $btn.text();
 
-        // Give the user clear feedback that generation is happening
-        $btn.text('Preparing PDF... (wait 60s)').addClass('disabled').css('opacity', '0.5').css('pointer-events', 'none');
+        // Give the user clear feedback with a 40s sequence
+        $btn.text('Preparing PDF... (wait 40s)').addClass('disabled').css('opacity', '0.5').css('pointer-events', 'none');
 
         var current_route = window.location.pathname.replace(/^\/|\/$/g, '');
         var download_url = '/api/method/wiki_pdf.pdf.download_wiki_pdf?route=' + encodeURIComponent(current_route);
 
-        // Trigger download via window.location.href
-        // This causes the browser to fetch the file. 
-        // Because the server returns "Content-Disposition: attachment", the current page stays open.
-        window.location.href = download_url;
+        // Simple sequence for button reset (total 40s)
+        setTimeout(function () {
+            $btn.text('Download Started...');
+        }, 15000);
 
-        // Reset after 90 seconds (generations can take up to 45s+)
         setTimeout(function () {
             $btn.text(original_text).removeClass('disabled').css('opacity', '0.9').css('pointer-events', 'auto');
-        }, 90000);
+        }, 40000);
+
+        // Immediate trigger for the browser's download manager
+        window.location.href = download_url;
     });
 
     var $target = $navbar.find('.sun-moon-container, .navbar-search').first();
