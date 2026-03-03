@@ -1,58 +1,61 @@
 frappe.ready(function () {
-    // Check if we are on a Wiki Page by looking for wiki content container
-    if ($('.wiki-content').length > 0) {
-        // Delay slightly to ensure navbar is fully rendered if dynamically loaded
-        setTimeout(add_download_pdf_button, 500);
+    // Only attempt to add the button if we are in the Wiki
+    if ($('.wiki-content').length > 0 || window.location.pathname.indexOf('/home') !== -1) {
+        setTimeout(setup_wiki_pdf_download, 600);
     }
 });
 
-function add_download_pdf_button() {
-    if ($('#btn-download-wiki-pdf').length > 0) {
-        return; // already added
-    }
+function setup_wiki_pdf_download() {
+    if ($('#btn-wiki-pdf-dl').length > 0) return;
 
     var $navbar = $('.navbar-nav').first();
     if ($navbar.length === 0) return;
 
-    var $container = $navbar.find('.sun-moon-container');
-
     var $btn = $('<a>')
-        .attr('id', 'btn-download-wiki-pdf')
+        .attr('id', 'btn-wiki-pdf-dl')
         .attr('href', '#')
-        .addClass('navbar-link mr-2 d-print-none')
+        .addClass('navbar-link mr-4 d-print-none')
         .css({
-            'white-space': 'nowrap',
-            'font-weight': 'bold',
-            'cursor': 'pointer'
+            'font-weight': '600',
+            'cursor': 'pointer',
+            'color': 'var(--text-color)',
+            'opacity': '0.9',
+            'transition': 'opacity 0.2s'
         })
         .text('Download PDF');
 
+    $btn.hover(
+        function () { $(this).css('opacity', '1').css('text-decoration', 'underline'); },
+        function () { $(this).css('opacity', '0.9').css('text-decoration', 'none'); }
+    );
+
     $btn.on('click', function (e) {
         e.preventDefault();
+        if ($btn.hasClass('disabled')) return;
 
-        // Get current route (strip leading slash and trailing slash)
+        var original_text = $btn.text();
+
+        // Give the user clear feedback that generation is happening
+        $btn.text('Preparing PDF... (wait 60s)').addClass('disabled').css('opacity', '0.5').css('pointer-events', 'none');
+
         var current_route = window.location.pathname.replace(/^\/|\/$/g, '');
-
         var download_url = '/api/method/wiki_pdf.pdf.download_wiki_pdf?route=' + encodeURIComponent(current_route);
 
-        // Use an invisible iframe to trigger the download without navigating away.
-        // The server sets Content-Disposition: attachment so the browser saves the file.
-        var iframe = document.createElement('iframe');
-        iframe.style.display = 'none';
-        iframe.src = download_url;
-        document.body.appendChild(iframe);
+        // Trigger download via window.location.href
+        // This causes the browser to fetch the file. 
+        // Because the server returns "Content-Disposition: attachment", the current page stays open.
+        window.location.href = download_url;
 
-        // Show loading feedback and remove the iframe after a reasonable delay
-        $btn.text('Generating PDF…').css('opacity', '0.6');
+        // Reset after 90 seconds (generations can take up to 45s+)
         setTimeout(function () {
-            document.body.removeChild(iframe);
-            $btn.text('Download PDF').css('opacity', '');
-        }, 60000); // 60 seconds max — enough for large PDFs
+            $btn.text(original_text).removeClass('disabled').css('opacity', '0.9').css('pointer-events', 'auto');
+        }, 90000);
     });
 
-    if ($container.length > 0) {
-        $container.before($btn);
+    var $target = $navbar.find('.sun-moon-container, .navbar-search').first();
+    if ($target.length > 0) {
+        $target.before($btn);
     } else {
-        $navbar.append($btn);
+        $navbar.prepend($btn);
     }
 }
