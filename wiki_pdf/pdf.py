@@ -1,15 +1,15 @@
 import frappe
 from frappe.utils.pdf import get_pdf
-# import pdfkit
+import pdfkit
 from frappe import _
 import re
+import time
 import markdown2
 import base64
 import mimetypes
 import os
 from bs4 import BeautifulSoup
 from frappe.core.doctype.file.utils import find_file_by_url
-# import time
 import requests
 from urllib.parse import urlparse
 
