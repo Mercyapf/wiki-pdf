@@ -145,6 +145,14 @@ th { background-color: #eee; font-weight: bold; text-align: left; }
 blockquote { border: 1px solid #bbb; border-left: 4pt solid #555; background: #f7f7f7; padding: 8pt 14pt; margin: 8pt 0; page-break-inside: avoid; }
 pre, code { background: #f4f4f4; font-family: monospace; border-radius: 3px; }
 pre { padding: 8pt; border: 1px solid #ddd; white-space: pre-wrap; margin: 6pt 0; page-break-inside: avoid; }
+
+/* TOC Styles */
+.toc-container { page-break-after: always; padding: 20pt; }
+.toc-title { font-size: 24pt; font-weight: bold; margin-bottom: 25pt; border-bottom: 2px solid #333; padding-bottom: 10pt; }
+.toc-row { display: flex; align-items: baseline; margin-bottom: 10pt; font-size: 13pt; font-weight: bold; }
+.toc-sub-row { margin-left: 20pt; display: flex; align-items: baseline; margin-bottom: 8pt; font-size: 11pt; color: #333; }
+.toc-dots { flex-grow: 1; border-bottom: 1px dotted #999; margin: 0 10pt; position: relative; top: -4px; }
+.toc-page { flex-shrink: 0; min-width: 20pt; text-align: right; }
 """
 
 FOOTER_HTML = """<!DOCTYPE html><html><head><script>
@@ -164,14 +172,36 @@ function subst() {
 
 def _write_footer():
     with tempfile.NamedTemporaryFile(suffix=".html", delete=False, mode="w", encoding="utf-8") as f:
-        f.write(FOOTER_HTML)
         return f.name
 
-def _pdf_options(footer_path):
+def _generate_toc(groups):
+    """Generates a manual Table of Contents HTML page with hierarchical numbering."""
+    toc_html = ['<div class="toc-container">', '<h1 class="toc-title">Table of Contents</h1>']
+    
+    for group in groups:
+        # Group Header Row
+        toc_html.append('<div class="toc-row">')
+        toc_html.append(f'<span>{group["number"]}. {group["label"] or "Introduction"}</span>')
+        toc_html.append('<div class="toc-dots"></div>')
+        toc_html.append('<span class="toc-page">-</span>')
+        toc_html.append('</div>')
+        
+        for page in group["pages"]:
+            # Page Sub-row
+            toc_html.append('<div class="toc-sub-row">')
+            toc_html.append(f'<span>{page["number"]} {page["title"]}</span>')
+            toc_html.append('<div class="toc-dots"></div>')
+            toc_html.append('<span class="toc-page">-</span>')
+            toc_html.append('</div>')
+            
+    toc_html.append('</div>')
+    return "".join(toc_html)
+
+def _pdf_options():
     return {
         "page-size": "A4", "margin-top": "15mm", "margin-bottom": "18mm", "margin-left": "18mm", "margin-right": "18mm",
-        "encoding": "UTF-8", "quiet": "", "enable-local-file-access": "", "footer-html": footer_path, "footer-spacing": "5",
-        "load-error-handling": "ignore", "load-media-error-handling": "ignore", "disable-smart-shrinking": ""
+        "encoding": "UTF-8", "quiet": "", "enable-local-file-access": "",
+        "footer-right": "[page]", "footer-font-size": "9", "footer-font-name": "Georgia"
     }
 
 def _wrap(body):
@@ -199,29 +229,56 @@ def download_wiki_pdf(page_name=None, route=None):
             p_names = [s.wiki_page for s in sidebar if s.wiki_page]
             p_map = {p.name: p for p in frappe.get_all("Wiki Page", filters={"name": ["in", p_names]}, fields=["name", "title", "content"], ignore_permissions=True, limit=0)}
             
+            ref_counter = 1
+            group_counter = 1
             for s in sidebar:
                 if s.wiki_page in p_map:
                     p = p_map[s.wiki_page]
                     label = s.parent_label or ""
-                    if not groups or groups[-1]["label"] != label: groups.append({"label": label, "pages": []})
-                    groups[-1]["pages"].append({"title": p.title, "content_html": _clean_for_pdf(_md_to_html(p.content or ""))})
+                    
+                    if not groups or groups[-1]["label"] != label:
+                        groups.append({"label": label, "number": group_counter, "pages": []})
+                        group_counter += 1
+                        ref_counter = 1 # Reset sub-number for new group
+                    
+                    full_number = f"{groups[-1]['number']}.{ref_counter}"
+                    groups[-1]["pages"].append({
+                        "number": full_number,
+                        "title": p.title,
+                        "content_html": _clean_for_pdf(_md_to_html(p.content or ""))
+                    })
+                    ref_counter += 1
 
         body_parts = []
+        
+        # TOC Page
+        if groups:
+            body_parts.append(_generate_toc(groups))
+
+        # Content Pages (Grouped)
         for i, group in enumerate(groups):
-            g_html = f'<div style="{"page-break-before:always;" if i > 0 else ""}">'
-            if group["label"]: g_html += f'<h1 class="group-name">{group["label"]}</h1>'
+            # No page break for first group as TOC handles page transition
+            pb_group = 'style="page-break-before:always;"' if i > 0 else ""
+            g_html = f'<div {pb_group}>'
+            if group["label"]:
+                g_title = f"{group['number']}. {group['label']}"
+                g_html += f'<h1 class="group-name">{g_title}</h1>'
+            
             for p_idx, page in enumerate(group["pages"]):
+                # ONLY force page break if it's NOT the first page in the group
+                # This keeps the Group Heading and the First Page together.
                 pb = 'style="page-break-before:always;"' if p_idx > 0 else ""
-                g_html += f'<div {pb}><h1 class="page-title">{page["title"]}</h1>{page["content_html"]}</div>'
+                g_html += f'<div {pb}><h2 class="page-title">{page["number"]} {page["title"]}</h2>{page["content_html"]}</div>'
+            
             g_html += '</div>'
             body_parts.append(g_html)
 
         html = _inline_images(_wrap("\n".join(body_parts)))
-        footer_path = _write_footer()
+        
         try:
-            pdf_bin = pdfkit.from_string(html, options=_pdf_options(footer_path))
+            pdf_bin = pdfkit.from_string(html, options=_pdf_options())
         finally:
-            if footer_path and os.path.exists(footer_path): os.remove(footer_path)
+            pass
 
         # Build filename
         filename = page_doc.title
@@ -254,11 +311,11 @@ def download_full_wiki_space(wiki_space):
             body_parts.append(f'<div style="{pb}"><h1 class="page-title">{p.title}</h1>{html}</div>')
 
         html = _inline_images(_wrap("\n".join(body_parts)))
-        footer_path = _write_footer()
+        
         try:
-            pdf_bin = pdfkit.from_string(html, options=_pdf_options(footer_path))
+            pdf_bin = pdfkit.from_string(html, options=_pdf_options())
         finally:
-            if footer_path and os.path.exists(footer_path): os.remove(footer_path)
+            pass
 
         frappe.local.response.filename = f"{wiki_space}.pdf".replace(" ", "_")
         frappe.local.response.filecontent = pdf_bin
