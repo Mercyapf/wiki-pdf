@@ -5,7 +5,9 @@ import base64
 import os
 import re
 import tempfile
+import io
 from bs4 import BeautifulSoup
+from pypdf import PdfReader, PdfWriter
 from frappe.core.doctype.file.utils import find_file_by_url
 from urllib.parse import urlparse, unquote
 from frappe import _
@@ -40,14 +42,14 @@ def _inline_images(html):
     for img in soup.find_all("img"):
         src = img.get("src")
         if not src or src.startswith("data:"): continue
-        
+
         # 1x1 transparent pixel fallback
         fallback = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
-        
+
         try:
             # Handle encoded URLs (spaces, etc.)
             real_src = unquote(src)
-            
+
             if real_src.startswith("/files/"):
                 # Handle standard Frappe /files/ path
                 path = frappe.get_site_path("public", "files", real_src.split("/")[-1])
@@ -97,7 +99,7 @@ def _split_tables(html, max_rows=25):
         thead, colgroup, rows = _get_thead(table_html), _get_colgroup(table_html), _get_tbody_rows(table_html)
         if len(rows) <= max_rows:
             return re.sub(r'<table([^>]*)>', lambda m: f'<table{m.group(1)} style="{TABLE_STYLE}">', table_html, 1, re.IGNORECASE)
-        
+
         chunks = [rows[i:i + max_rows] for i in range(0, len(rows), max_rows)]
         parts = []
         for idx, chunk in enumerate(chunks):
@@ -133,7 +135,7 @@ PDF_CSS = """
 @page { size: A4; margin: 15mm 18mm; }
 body { font-family: Georgia, serif; font-size: 11pt; line-height: 1.4; color: #111; margin: 0; padding: 0; }
 h1.group-name { font-size: 20pt; font-weight: bold; border-bottom: 2px solid #333; padding-bottom: 4pt; margin-bottom: 14pt; page-break-after: avoid !important; }
-h1.page-title { color: #1a52a0; font-size: 16pt; font-weight: bold; margin-bottom: 12pt; page-break-after: avoid !important; }
+h1.page-title, h2.page-title { color: #1a52a0; font-size: 16pt; font-weight: bold; margin-bottom: 12pt; page-break-after: avoid !important; }
 h1, h2, h3, h4 { color: #222; margin-top: 14pt; margin-bottom: 6pt; page-break-after: avoid !important; }
 p { margin: 4pt 0; }
 img { max-width: 100%; height: auto; display: block; margin: 8pt 0; }
@@ -145,15 +147,141 @@ th { background-color: #eee; font-weight: bold; text-align: left; }
 blockquote { border: 1px solid #bbb; border-left: 4pt solid #555; background: #f7f7f7; padding: 8pt 14pt; margin: 8pt 0; page-break-inside: avoid; }
 pre, code { background: #f4f4f4; font-family: monospace; border-radius: 3px; }
 pre { padding: 8pt; border: 1px solid #ddd; white-space: pre-wrap; margin: 6pt 0; page-break-inside: avoid; }
-
-/* TOC Styles */
-.toc-container { page-break-after: always; padding: 20pt; }
-.toc-title { font-size: 24pt; font-weight: bold; margin-bottom: 25pt; border-bottom: 2px solid #333; padding-bottom: 10pt; }
-.toc-row { display: flex; align-items: baseline; margin-bottom: 10pt; font-size: 13pt; font-weight: bold; }
-.toc-sub-row { margin-left: 20pt; display: flex; align-items: baseline; margin-bottom: 8pt; font-size: 11pt; color: #333; }
-.toc-dots { flex-grow: 1; border-bottom: 1px dotted #999; margin: 0 10pt; position: relative; top: -4px; }
-.toc-page { flex-shrink: 0; min-width: 20pt; text-align: right; }
 """
+
+# डिजाइन टोकन for manual TOC
+TOC_STYLE = """
+<style>
+    body { font-family: Georgia, serif; padding: 20mm; margin: 0; color: #111; }
+    h1 { font-size: 24pt; font-weight: bold; border-bottom: 2px solid #333; padding-bottom: 10px; margin-bottom: 30px; }
+    .toc-item { font-size: 13pt; margin-bottom: 12px; clear: both; overflow: hidden; position: relative; }
+    .toc-title { float: left; background: white; padding-right: 5px; position: relative; z-index: 2; }
+    .toc-page { float: right; background: white; padding-left: 5px; position: relative; z-index: 2; font-weight: bold; color: #1a52a0; }
+    .dots { position: absolute; left: 0; right: 0; bottom: 6px; border-bottom: 1px solid #ccc; z-index: 1; }
+    .level-1 .dots { left: 25px; }
+    .level-0 { font-weight: bold; margin-top: 18px; color: #000; }
+    .level-1 { padding-left: 25px; color: #444; font-size: 11pt; }
+</style>
+"""
+
+FOOTER_STYLE = """
+<style>
+    body { font-family: Georgia, serif; font-size: 10pt; text-align: center; margin: 0; padding: 0; background: transparent !important; }
+</style>
+"""
+
+def _add_page_numbers(pdf_bin):
+    """Adds 'X' to the bottom center of each page using pypdf and a temp HTML PDF."""
+    try:
+        reader = PdfReader(io.BytesIO(pdf_bin))
+        writer = PdfWriter()
+        total_pages = len(reader.pages)
+        
+        for i in range(total_pages):
+            page_num = i + 1
+            # Generate a small 20mm height PDF to avoid covering content
+            footer_content = f"<html><head><meta charset='UTF-8'>{FOOTER_STYLE}</head><body style='margin:0;'><div style='position:absolute;bottom:5mm;width:100%;text-align:center;'>{page_num}</div></body></html>"
+            footer_pdf_bin = pdfkit.from_string(footer_content, False, options={
+                "page-height": "20mm", "page-width": "210mm", "margin-top": "0", "margin-bottom": "0", "margin-left": "0", "margin-right": "0",
+                "quiet": ""
+            })
+            
+            if not footer_pdf_bin: continue
+
+            footer_reader = PdfReader(io.BytesIO(footer_pdf_bin))
+            if not footer_reader.pages: continue
+
+            content_page = reader.pages[i]
+            footer_page = footer_reader.pages[0]
+            
+            content_page.merge_page(footer_page)
+            writer.add_page(content_page)
+            
+        output = io.BytesIO()
+        writer.write(output)
+        return output.getvalue()
+    except Exception as e:
+        frappe.log_error(f"Page numbering error: {str(e)}")
+        return pdf_bin
+
+def _post_process_pdf(main_html, groups):
+    """Generates PDF with manual TOC post-processing."""
+    # 1. Add invisible anchors to groups and pages
+    anchor_html = []
+    for g_idx, group in enumerate(groups):
+        g_id = f"GTOC-{g_idx}"
+        group["anchor"] = g_id
+        # Use simple white text for reliable indexing (invisible on white background)
+        g_div = f'<div style="color:#ffffff;font-size:1px;position:absolute;z-index:-1;">{g_id}</div>'
+        
+        parts = [g_div]
+        if group["label"]:
+            parts.append(f'<h1 class="group-name">{group["label"]}</h1>')
+            
+        for p_idx, page in enumerate(group["pages"]):
+            p_id = f"PTOC-{g_idx}-{p_idx}"
+            page["anchor"] = p_id
+            p_div = f'<div style="color:#ffffff;font-size:1px;position:absolute;z-index:-1;">{p_id}</div>'
+            pb = 'style="page-break-before:always;"' if (g_idx > 0 or p_idx > 0) else ""
+            tag = "h2" if group["label"] else "h1"
+            parts.append(f'<div {pb}>{p_div}<{tag} class="page-title">{page["title"]}</{tag}>{page["content_html"]}</div>')
+        
+        anchor_html.append("\n".join(parts))
+
+    full_body = "\n".join(anchor_html)
+    content_html = _inline_images(_wrap(full_body))
+    
+    # 2. Generate content PDF
+    content_pdf = pdfkit.from_string(content_html, False, options=_pdf_options(None))
+    if not content_pdf:
+        frappe.log_error("Content PDF generation failed (empty result)")
+        return b""
+    
+    # 3. Index pages
+    reader = PdfReader(io.BytesIO(content_pdf))
+    page_map = {}
+    for i, page in enumerate(reader.pages):
+        text = page.extract_text()
+        matches = re.findall(r'[GP]TOC-\d+(?:-\d+)?', text)
+        for m in matches:
+            if m not in page_map:
+                page_map[m] = i + 1 
+    
+    if not page_map:
+        frappe.log_error("PDF manual indexing failed: No anchors found in content PDF")
+                
+    # 4. Generate TOC PDF
+    def build_toc(shift=0):
+        toc_lines = ['<h1>Table of Contents</h1><div class="toc-container">']
+        for g_idx, group in enumerate(groups):
+            if group["label"]:
+                p_num = page_map.get(group["anchor"], 1) + shift
+                toc_lines.append(f'<div class="toc-item level-0"><span class="toc-title">{group["label"]}</span><span class="toc-page">{p_num}</span><div class="dots"></div></div>')
+            for p_idx, page in enumerate(group["pages"]):
+                p_num = page_map.get(page["anchor"], 1) + shift
+                level = "level-1" if group["label"] else "level-0"
+                toc_lines.append(f'<div class="toc-item {level}"><span class="toc-title">{page["title"]}</span><span class="toc-page">{p_num}</span><div class="dots"></div></div>')
+        toc_lines.append('</div>')
+        return f"<html><head><meta charset='UTF-8'>{TOC_STYLE}</head><body>{''.join(toc_lines)}</body></html>"
+
+    # Pass 1: Estimate TOC size
+    toc_pdf = pdfkit.from_string(build_toc(0), False, options=_pdf_options(None))
+    toc_page_count = len(PdfReader(io.BytesIO(toc_pdf)).pages)
+    
+    # Pass 2: Final TOC with correct page shifts
+    toc_pdf = pdfkit.from_string(build_toc(toc_page_count), False, options=_pdf_options(None))
+    toc_reader = PdfReader(io.BytesIO(toc_pdf))
+    
+    # 5. Merge
+    writer = PdfWriter()
+    for page in toc_reader.pages: writer.add_page(page)
+    for page in reader.pages: writer.add_page(page)
+    
+    output = io.BytesIO()
+    writer.write(output)
+    
+    # 6. Final Pass: Add Page Numbers
+    return _add_page_numbers(output.getvalue())
 
 FOOTER_HTML = """<!DOCTYPE html><html><head><script>
 function subst() {
@@ -171,38 +299,18 @@ function subst() {
 </body></html>"""
 
 def _write_footer():
-    with tempfile.NamedTemporaryFile(suffix=".html", delete=False, mode="w", encoding="utf-8") as f:
-        return f.name
+    return None # Unpatched QT doesn't support this
 
-def _generate_toc(groups):
-    """Generates a manual Table of Contents HTML page with hierarchical numbering."""
-    toc_html = ['<div class="toc-container">', '<h1 class="toc-title">Table of Contents</h1>']
-    
-    for group in groups:
-        # Group Header Row
-        toc_html.append('<div class="toc-row">')
-        toc_html.append(f'<span>{group["number"]}. {group["label"] or "Introduction"}</span>')
-        toc_html.append('<div class="toc-dots"></div>')
-        toc_html.append('<span class="toc-page">-</span>')
-        toc_html.append('</div>')
-        
-        for page in group["pages"]:
-            # Page Sub-row
-            toc_html.append('<div class="toc-sub-row">')
-            toc_html.append(f'<span>{page["number"]} {page["title"]}</span>')
-            toc_html.append('<div class="toc-dots"></div>')
-            toc_html.append('<span class="toc-page">-</span>')
-            toc_html.append('</div>')
-            
-    toc_html.append('</div>')
-    return "".join(toc_html)
+def _write_toc_xsl():
+    return None # Unpatched QT doesn't support this
 
-def _pdf_options():
-    return {
+def _pdf_options(footer_path, toc_xsl_path=None):
+    opts = {
         "page-size": "A4", "margin-top": "15mm", "margin-bottom": "18mm", "margin-left": "18mm", "margin-right": "18mm",
-        "encoding": "UTF-8", "quiet": "", "enable-local-file-access": "",
-        "footer-right": "[page]", "footer-font-size": "9", "footer-font-name": "Georgia"
+        "encoding": "UTF-8", "quiet": "", "enable-local-file-access": "", 
+        "load-error-handling": "ignore", "load-media-error-handling": "ignore"
     }
+    return opts
 
 def _wrap(body):
     return f"<html><head><meta charset='UTF-8'><style>{PDF_CSS}</style></head><body>{body}</body></html>"
@@ -217,7 +325,7 @@ def download_wiki_pdf(page_name=None, route=None):
     try:
         target_name = page_name or _find_page(route)
         if not target_name: frappe.throw(f"Wiki Page not found: {route or page_name}")
-        
+
         page_doc = frappe.get_doc("Wiki Page", target_name, ignore_permissions=True)
         wiki_group_item = frappe.db.get_value("Wiki Group Item", {"wiki_page": target_name}, ["parent"], as_dict=True)
 
@@ -228,64 +336,22 @@ def download_wiki_pdf(page_name=None, route=None):
             sidebar = frappe.get_all("Wiki Group Item", filters={"parent": wiki_group_item.parent}, fields=["wiki_page", "parent_label"], order_by="idx asc", ignore_permissions=True, limit=0)
             p_names = [s.wiki_page for s in sidebar if s.wiki_page]
             p_map = {p.name: p for p in frappe.get_all("Wiki Page", filters={"name": ["in", p_names]}, fields=["name", "title", "content"], ignore_permissions=True, limit=0)}
-            
-            ref_counter = 1
-            group_counter = 1
+
             for s in sidebar:
                 if s.wiki_page in p_map:
                     p = p_map[s.wiki_page]
                     label = s.parent_label or ""
-                    
-                    if not groups or groups[-1]["label"] != label:
-                        groups.append({"label": label, "number": group_counter, "pages": []})
-                        group_counter += 1
-                        ref_counter = 1 # Reset sub-number for new group
-                    
-                    full_number = f"{groups[-1]['number']}.{ref_counter}"
-                    groups[-1]["pages"].append({
-                        "number": full_number,
-                        "title": p.title,
-                        "content_html": _clean_for_pdf(_md_to_html(p.content or ""))
-                    })
-                    ref_counter += 1
+                    if not groups or groups[-1]["label"] != label: groups.append({"label": label, "pages": []})
+                    groups[-1]["pages"].append({"title": p.title, "content_html": _clean_for_pdf(_md_to_html(p.content or ""))})
 
-        body_parts = []
-        
-        # TOC Page
-        if groups:
-            body_parts.append(_generate_toc(groups))
+        if not groups or not any(g["pages"] for g in groups):
+            frappe.throw(_("No content found to generate PDF"))
 
-        # Content Pages (Grouped)
-        for i, group in enumerate(groups):
-            # No page break for first group as TOC handles page transition
-            pb_group = 'style="page-break-before:always;"' if i > 0 else ""
-            g_html = f'<div {pb_group}>'
-            if group["label"]:
-                g_title = f"{group['number']}. {group['label']}"
-                g_html += f'<h1 class="group-name">{g_title}</h1>'
-            
-            for p_idx, page in enumerate(group["pages"]):
-                # ONLY force page break if it's NOT the first page in the group
-                # This keeps the Group Heading and the First Page together.
-                pb = 'style="page-break-before:always;"' if p_idx > 0 else ""
-                g_html += f'<div {pb}><h2 class="page-title">{page["number"]} {page["title"]}</h2>{page["content_html"]}</div>'
-            
-            g_html += '</div>'
-            body_parts.append(g_html)
-
-        html = _inline_images(_wrap("\n".join(body_parts)))
-        
-        try:
-            pdf_bin = pdfkit.from_string(html, options=_pdf_options())
-        finally:
-            pass
+        pdf_bin = _post_process_pdf(None, groups)
 
         # Build filename
-        filename = page_doc.title
-        if wiki_group_item:
-             space_name = frappe.db.get_value("Wiki Space", wiki_group_item.parent, "space_name")
-             filename = space_name or filename
-        
+        filename = "Creche Guideline"
+
         frappe.local.response.filename = f"{filename or 'Wiki'}.pdf".replace(" ", "_")
         frappe.local.response.filecontent = pdf_bin
         frappe.local.response.type = "download"
@@ -299,28 +365,19 @@ def download_full_wiki_space(wiki_space):
     """Download entire space by wiki_space route name."""
     try:
         root_name = frappe.get_doc("Wiki Page", {"route": wiki_space}, ignore_permissions=True).name
-        
+
         # Pages
         all_pages = frappe.get_all("Wiki Page", filters={"published": 1}, fields=["name", "title", "content", "parent_wiki_page"], order_by="creation asc", ignore_permissions=True, limit=0)
         pages = [p for p in all_pages if p.name == root_name or p.parent_wiki_page == root_name]
-        
-        body_parts = []
-        for i, p in enumerate(pages):
-            pb = "page-break-before:always;" if i > 0 else ""
-            html = _clean_for_pdf(_md_to_html(p.content or ""))
-            body_parts.append(f'<div style="{pb}"><h1 class="page-title">{p.title}</h1>{html}</div>')
 
-        html = _inline_images(_wrap("\n".join(body_parts)))
-        
-        try:
-            pdf_bin = pdfkit.from_string(html, options=_pdf_options())
-        finally:
-            pass
+        if not pages:
+            frappe.throw(_("No content found to generate PDF"))
 
-        frappe.local.response.filename = f"{wiki_space}.pdf".replace(" ", "_")
+        pdf_bin = _post_process_pdf(None, [{"label": None, "pages": pages}])
+
+        frappe.local.response.filename = f"Creche Guideline.pdf".replace(" ", "_")
         frappe.local.response.filecontent = pdf_bin
         frappe.local.response.type = "download"
 
     except Exception as e:
         frappe.log_error(frappe.get_traceback(), "Wiki Full Space PDF Error")
-        frappe.throw(f"Error: {str(e)}")
