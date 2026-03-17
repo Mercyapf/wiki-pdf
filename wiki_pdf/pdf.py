@@ -49,28 +49,24 @@ def _inline_images(html):
         try:
             # Handle encoded URLs (spaces, etc.)
             real_src = unquote(src)
-
+            
+            # Try to resolve via find_file_by_url for any local-looking path
+            if not real_src.startswith("http") or real_src.startswith(frappe.utils.get_url()):
+                # Get the path part (e.g., /files/foo.jpg)
+                url_path = urlparse(real_src).path
+                file_doc = find_file_by_url(url_path)
+                if file_doc and os.path.exists(file_doc.get_full_path()):
+                    img["src"] = os.path.abspath(file_doc.get_full_path())
+                    continue
+            
+            # Fallback for standard /files/ if find_file_by_url failed
             if real_src.startswith("/files/"):
-                # Handle standard Frappe /files/ path
                 path = frappe.get_site_path("public", "files", real_src.split("/")[-1])
                 if os.path.exists(path):
                     img["src"] = os.path.abspath(path)
                     continue
-
-            # Fallback to inlining if it's a URL or if path resolution failed
-            path = real_src
-            if "://" not in real_src or real_src.startswith(frappe.utils.get_url()):
-                # Resolve relative or same-site URL
-                path = urlparse(real_src).path
-                file_doc = find_file_by_url(path)
-                if file_doc and os.path.exists(file_doc.get_full_path()):
-                    img["src"] = os.path.abspath(file_doc.get_full_path())
-                else:
-                    img["src"] = fallback
-            else:
-                # External images: keep as is but wkhtmltopdf might fail without network
-                pass
-        except Exception:
+        except Exception as e:
+            frappe.log_error(f"Image resolution error for {src}: {str(e)}", "Wiki PDF Image Error")
             img["src"] = fallback
     return str(soup)
 
@@ -134,9 +130,12 @@ def _clean_for_pdf(html):
 PDF_CSS = """
 @page { size: A4; margin: 15mm 18mm; }
 body { font-family: Georgia, serif; font-size: 11pt; line-height: 1.4; color: #111; margin: 0; padding: 0; }
-h1.group-name { font-size: 20pt; font-weight: bold; border-bottom: 2px solid #333; padding-bottom: 4pt; margin-bottom: 14pt; page-break-after: avoid !important; }
-h1.page-title, h2.page-title { color: #1a52a0; font-size: 16pt; font-weight: bold; margin-bottom: 12pt; page-break-after: avoid !important; }
-h1, h2, h3, h4 { color: #222; margin-top: 14pt; margin-bottom: 6pt; page-break-after: avoid !important; }
+h1.group-name { font-size: 22pt; font-weight: bold; border-bottom: 2px solid #333; padding-bottom: 4pt; margin-bottom: 14pt; page-break-after: avoid !important; }
+h1.page-title, h2.page-title { color: #1a52a0; font-size: 22pt; font-weight: bold; margin-bottom: 12pt; page-break-after: avoid !important; }
+h1 { font-size: 18pt; color: #222; margin-top: 14pt; margin-bottom: 6pt; page-break-after: avoid !important; }
+h2 { font-size: 16pt; color: #222; margin-top: 14pt; margin-bottom: 6pt; page-break-after: avoid !important; }
+h3 { font-size: 14pt; color: #222; margin-top: 12pt; margin-bottom: 4pt; page-break-after: avoid !important; }
+h4 { font-size: 12pt; color: #222; margin-top: 10pt; margin-bottom: 4pt; page-break-after: avoid !important; }
 p { margin: 4pt 0; }
 img { max-width: 100%; height: auto; display: block; margin: 8pt 0; }
 table { width: 100%; border-collapse: collapse; margin: 8pt 0; table-layout: fixed; font-size: 10pt; page-break-inside: auto; }
@@ -170,7 +169,7 @@ FOOTER_STYLE = """
 </style>
 """
 
-def _add_page_numbers(pdf_bin):
+def _add_page_numbers(pdf_bin, skip_first=False, skip_last=False):
     """Adds 'X' to the bottom center of each page using pypdf and a temp HTML PDF."""
     try:
         reader = PdfReader(io.BytesIO(pdf_bin))
@@ -178,6 +177,9 @@ def _add_page_numbers(pdf_bin):
         total_pages = len(reader.pages)
         
         for i in range(total_pages):
+            if (skip_first and i == 0) or (skip_last and i == total_pages - 1):
+                writer.add_page(reader.pages[i])
+                continue
             page_num = i + 1
             # Generate a small 20mm height PDF to avoid covering content
             footer_content = f"<html><head><meta charset='UTF-8'>{FOOTER_STYLE}</head><body style='margin:0;'><div style='position:absolute;bottom:5mm;width:100%;text-align:center;'>{page_num}</div></body></html>"
@@ -211,10 +213,13 @@ def _post_process_pdf(main_html, groups):
     for g_idx, group in enumerate(groups):
         g_id = f"GTOC-{g_idx}"
         group["anchor"] = g_id
-        # Use simple white text for reliable indexing (invisible on white background)
-        g_div = f'<div style="color:#ffffff;font-size:1px;position:absolute;z-index:-1;">{g_id}</div>'
+        # Apply page break to the group container itself (except for the first group)
+        gb = 'style="page-break-before:always;"' if g_idx > 0 else ""
         
-        parts = [g_div]
+        parts = [f'<div {gb}>']
+        # Invisible anchor
+        parts.append(f'<div style="color:#ffffff;font-size:1px;position:absolute;z-index:-1;">{g_id}</div>')
+        
         if group["label"]:
             parts.append(f'<h1 class="group-name">{group["label"]}</h1>')
             
@@ -222,16 +227,61 @@ def _post_process_pdf(main_html, groups):
             p_id = f"PTOC-{g_idx}-{p_idx}"
             page["anchor"] = p_id
             p_div = f'<div style="color:#ffffff;font-size:1px;position:absolute;z-index:-1;">{p_id}</div>'
-            pb = 'style="page-break-before:always;"' if (g_idx > 0 or p_idx > 0) else ""
+            # If we already had a group label/header, we don't need another break for the first page
+            pb = 'style="page-break-before:always;"' if (p_idx > 0 or (g_idx > 0 and not group["label"])) else ""
             tag = "h2" if group["label"] else "h1"
             parts.append(f'<div {pb}>{p_div}<{tag} class="page-title">{page["title"]}</{tag}>{page["content_html"]}</div>')
         
+        parts.append('</div>')
         anchor_html.append("\n".join(parts))
 
     full_body = "\n".join(anchor_html)
     content_html = _inline_images(_wrap(full_body))
     
-    # 2. Generate content PDF
+    # 2. Generate Cover PDF
+    cover_html = f"""
+    <html>
+    <head>
+        <meta charset='UTF-8'>
+        <style>
+            html, body {{ margin: 0; padding: 0; width: 100%; height: 100%; }}
+            .cover-img {{ width: 100%; height: auto; display: block; }}
+        </style>
+    </head>
+    <body style="margin: 0; padding: 0;">
+        <div style="width: 100%; height: 100%; overflow: hidden;">
+            <img src="/files/Creche Frontpage.jpg" style="width: 100%; height: auto; min-height: 100%; display: block; margin: 0 auto;">
+        </div>
+    </body>
+    </html>
+    """
+    cover_html = _inline_images(cover_html)
+    
+    # Debug: Log if image path was resolved
+    if "files/" not in cover_html and "/files/" not in cover_html:
+        # This implies it was replaced by an absolute path or fallback
+        pass
+    else:
+        frappe.log_error("Cover image path might not have been resolved in _inline_images", "Wiki PDF Cover Error")
+
+    cover_pdf_bin = pdfkit.from_string(cover_html, False, options={
+        "page-size": "A4", "margin-top": "0", "margin-bottom": "0", "margin-left": "0", "margin-right": "0",
+        "enable-local-file-access": "", "quiet": ""
+    })
+    
+    # 3. Generate Back Cover PDF
+    back_html = _inline_images(f"""
+    <html>
+    <head><meta charset='UTF-8'><style>html, body {{ margin: 0; padding: 0; width: 100%; height: 100%; }}</style></head>
+    <body style="margin: 0; padding: 0;"><div style="width: 100%; height: 100%; overflow: hidden;">
+        <img src="/files/creche backpage.jpg" style="width: 100%; height: auto; min-height: 100%; display: block; margin: 0 auto;">
+    </div></body></html>""")
+    back_pdf_bin = pdfkit.from_string(back_html, False, options={
+        "page-size": "A4", "margin-top": "0", "margin-bottom": "0", "margin-left": "0", "margin-right": "0",
+        "enable-local-file-access": "", "quiet": ""
+    })
+
+    # 4. Generate content PDF
     content_pdf = pdfkit.from_string(content_html, False, options=_pdf_options(None))
     if not content_pdf:
         frappe.log_error("Content PDF generation failed (empty result)")
@@ -268,20 +318,35 @@ def _post_process_pdf(main_html, groups):
     toc_pdf = pdfkit.from_string(build_toc(0), False, options=_pdf_options(None))
     toc_page_count = len(PdfReader(io.BytesIO(toc_pdf)).pages)
     
-    # Pass 2: Final TOC with correct page shifts
-    toc_pdf = pdfkit.from_string(build_toc(toc_page_count), False, options=_pdf_options(None))
+    # Pass 2: Final TOC with correct page shifts (Cover + TOC pages)
+    shift_amount = 1 + toc_page_count
+    toc_pdf = pdfkit.from_string(build_toc(shift_amount), False, options=_pdf_options(None))
     toc_reader = PdfReader(io.BytesIO(toc_pdf))
     
     # 5. Merge
     writer = PdfWriter()
+    
+    # Add Cover
+    if cover_pdf_bin:
+        cover_reader = PdfReader(io.BytesIO(cover_pdf_bin))
+        for page in cover_reader.pages: writer.add_page(page)
+
+    # Add TOC
     for page in toc_reader.pages: writer.add_page(page)
+    
+    # Add Content
     for page in reader.pages: writer.add_page(page)
+
+    # Add Back Cover
+    if back_pdf_bin:
+        back_reader = PdfReader(io.BytesIO(back_pdf_bin))
+        for page in back_reader.pages: writer.add_page(page)
     
     output = io.BytesIO()
     writer.write(output)
     
-    # 6. Final Pass: Add Page Numbers
-    return _add_page_numbers(output.getvalue())
+    # 6. Final Pass: Add Page Numbers (skip cover and backpage)
+    return _add_page_numbers(output.getvalue(), skip_first=True, skip_last=True)
 
 FOOTER_HTML = """<!DOCTYPE html><html><head><script>
 function subst() {
