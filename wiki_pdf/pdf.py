@@ -20,7 +20,20 @@ _MD_EXTRAS = ["tables", "fenced-code-blocks", "strike", "cuddled-lists", "break-
 
 def _md_to_html(text):
     if not text: return ""
-    return markdown2.markdown(text, extras=_MD_EXTRAS)
+    try:
+        return markdown2.markdown(text, extras=_MD_EXTRAS)
+    except AssertionError:
+        # Known issue in markdown2 with malformed HTML blocks
+        # Fallback: Try without complex extras that often trigger the regex bug
+        try:
+            simple_extras = [e for e in _MD_EXTRAS if e not in ["tables", "fenced-code-blocks"]]
+            return markdown2.markdown(text, extras=simple_extras)
+        except Exception:
+            # Last resort: just return text (potentially escaped)
+            return f"<pre>{frappe.utils.escape_html(text)}</pre>"
+    except Exception as e:
+        frappe.log_error(f"Markdown parsing error: {str(e)}", "Wiki PDF Markdown Error")
+        return f"<div>Error parsing content: {frappe.utils.escape_html(text[:100])}...</div>"
 
 def _find_page(route):
     """Robust lookup for Wiki Page by route."""
