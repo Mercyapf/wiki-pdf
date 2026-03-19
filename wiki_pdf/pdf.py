@@ -20,20 +20,7 @@ _MD_EXTRAS = ["tables", "fenced-code-blocks", "strike", "cuddled-lists", "break-
 
 def _md_to_html(text):
     if not text: return ""
-    try:
-        return markdown2.markdown(text, extras=_MD_EXTRAS)
-    except AssertionError:
-        # Known issue in markdown2 with malformed HTML blocks
-        # Fallback: Try without complex extras that often trigger the regex bug
-        try:
-            simple_extras = [e for e in _MD_EXTRAS if e not in ["tables", "fenced-code-blocks"]]
-            return markdown2.markdown(text, extras=simple_extras)
-        except Exception:
-            # Last resort: just return text (potentially escaped)
-            return f"<pre>{frappe.utils.escape_html(text)}</pre>"
-    except Exception as e:
-        frappe.log_error(f"Markdown parsing error: {str(e)}", "Wiki PDF Markdown Error")
-        return f"<div>Error parsing content: {frappe.utils.escape_html(text[:100])}...</div>"
+    return markdown2.markdown(text, extras=_MD_EXTRAS)
 
 def _find_page(route):
     """Robust lookup for Wiki Page by route."""
@@ -183,40 +170,60 @@ FOOTER_STYLE = """
 """
 
 def _add_page_numbers(pdf_bin, skip_first=False, skip_last=False):
-    """Adds 'X' to the bottom center of each page using pypdf and a temp HTML PDF."""
+    """Adds page numbers using a single pdfkit call for all pages (prevents worker timeout on large docs)."""
     try:
         reader = PdfReader(io.BytesIO(pdf_bin))
-        writer = PdfWriter()
         total_pages = len(reader.pages)
-        
+
+        # Build ONE html document with all footer pages (each 20mm tall, same as before)
+        # This replaces the old O(N) loop of pdfkit calls with a single call.
+        footer_divs = []
         for i in range(total_pages):
+            page_break = "page-break-after:always;" if i < total_pages - 1 else ""
             if (skip_first and i == 0) or (skip_last and i == total_pages - 1):
-                writer.add_page(reader.pages[i])
-                continue
-            page_num = i + 1
-            # Generate a small 20mm height PDF to avoid covering content
-            footer_content = f"<html><head><meta charset='UTF-8'>{FOOTER_STYLE}</head><body style='margin:0;'><div style='position:absolute;bottom:5mm;width:100%;text-align:center;'>{page_num}</div></body></html>"
-            footer_pdf_bin = pdfkit.from_string(footer_content, False, options={
-                "page-height": "20mm", "page-width": "210mm", "margin-top": "0", "margin-bottom": "0", "margin-left": "0", "margin-right": "0",
-                "quiet": ""
-            })
-            
-            if not footer_pdf_bin: continue
+                # Empty placeholder page so page indices stay aligned
+                footer_divs.append(f'<div style="{page_break}width:210mm;height:20mm;"></div>')
+            else:
+                page_num = i + 1
+                footer_divs.append(
+                    f'<div style="{page_break}width:210mm;height:20mm;position:relative;font-family:Georgia,serif;font-size:10pt;">'
+                    f'<div style="position:absolute;bottom:2mm;width:100%;text-align:center;">{page_num}</div>'
+                    f'</div>'
+                )
 
-            footer_reader = PdfReader(io.BytesIO(footer_pdf_bin))
-            if not footer_reader.pages: continue
+        all_footers_html = (
+            "<html><head><meta charset='UTF-8'>"
+            "<style>body{margin:0;padding:0;background:transparent;}</style>"
+            "</head><body>"
+            + "".join(footer_divs)
+            + "</body></html>"
+        )
 
+        # ONE pdfkit call for all pages
+        footer_pdf_bin = pdfkit.from_string(all_footers_html, False, options={
+            "page-height": "20mm", "page-width": "210mm",
+            "margin-top": "0", "margin-bottom": "0", "margin-left": "0", "margin-right": "0",
+            "quiet": ""
+        })
+
+        if not footer_pdf_bin:
+            frappe.log_error("Footer PDF generation returned empty", "Wiki PDF Error")
+            return pdf_bin
+
+        footer_reader = PdfReader(io.BytesIO(footer_pdf_bin))
+        writer = PdfWriter()
+
+        for i in range(total_pages):
             content_page = reader.pages[i]
-            footer_page = footer_reader.pages[0]
-            
-            content_page.merge_page(footer_page)
+            if i < len(footer_reader.pages):
+                content_page.merge_page(footer_reader.pages[i])
             writer.add_page(content_page)
-            
+
         output = io.BytesIO()
         writer.write(output)
         return output.getvalue()
     except Exception as e:
-        frappe.log_error(f"Page numbering error: {str(e)}")
+        frappe.log_error(f"Page numbering error: {str(e)}", "Wiki PDF Error")
         return pdf_bin
 
 def _post_process_pdf(main_html, groups):
@@ -459,3 +466,4 @@ def download_full_wiki_space(wiki_space):
 
     except Exception as e:
         frappe.log_error(frappe.get_traceback(), "Wiki Full Space PDF Error")
+        frappe.throw(f"Error: {str(e)}")
