@@ -31,13 +31,14 @@ def _md_to_html(text):
         tables = []
         def _hide(match):
             tables.append(match.group(0))
-            return f"\n\n---PDF_TABLE_HIDDEN_{len(tables)-1}---\n\n"
+            return f"\n\nPROTECTEDTABLE{len(tables)-1}\n\n"
         
         hidden_md = re.sub(r'(<table[^>]*>.*?</table>)', _hide, text, flags=re.DOTALL | re.IGNORECASE)
         try:
             html = markdown2.markdown(hidden_md, extras=_MD_EXTRAS)
             for i, table_html in enumerate(tables):
-                placeholder = f"---PDF_TABLE_HIDDEN_{i}---"
+                placeholder = f"PROTECTEDTABLE{i}"
+                # Handle potential markdown wrapping
                 html = html.replace(f"<p>{placeholder}</p>", table_html)
                 html = html.replace(placeholder, table_html)
             return html
