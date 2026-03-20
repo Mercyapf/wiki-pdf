@@ -305,13 +305,39 @@ def _post_process_pdf(main_html, groups):
     
     # 2. Generate Cover PDF
     def _get_base64_image(src):
-        """Switch to Full URL for Cloud compatibility (large Base64 can fail in wkhtmltopdf)."""
+        """Universal 'Local File' Cloud Resolution: Content API -> Temp File -> file:// path."""
         try:
-            full_url = frappe.utils.get_url(unquote(src).strip())
-            # Debug Log as requested by ChatGPT
-            frappe.log_error(full_url, "FRONT IMAGE URL")
-            return full_url
-        except Exception:
+            real_src = unquote(src).strip()
+            if real_src.startswith("data:"): return real_src
+            
+            # 1. Flexible Lookup (Unified ChatGPT + Robust Logic)
+            fname = real_src.split("/")[-1]
+            file_name_db = frappe.db.get_value("File", {"file_url": real_src}, "name")
+            if not file_name_db:
+                # Try by filename as a backup (handles space/naming mismatches)
+                file_name_db = frappe.db.get_value("File", {"file_name": ["like", f"%{fname}%"]}, "name")
+            
+            if file_name_db:
+                file_doc = frappe.get_doc("File", file_name_db)
+                # get_content() is the "Holy Grail" for Frappe Cloud/S3
+                content = file_doc.get_content()
+                if content:
+                    # Write to a temporary file (bypasses SSL, Networking, and Base64 size issues)
+                    ext = "." + file_doc.file_name.split(".")[-1].lower() if "." in file_doc.file_name else ".jpg"
+                    # Using a stable /tmp path for wkhtmltopdf access
+                    tmp_path = os.path.join(tempfile.gettempdir(), f"wiki_cov_{file_name_db[:10]}{ext}")
+                    with open(tmp_path, "wb") as f:
+                        f.write(content)
+                    
+                    res = f"file://{tmp_path}"
+                    # Debug Log
+                    frappe.log_error(res, "FRONT IMAGE FILE")
+                    return res
+            
+            # 2. Last resort fallback to URL
+            return frappe.utils.get_url(real_src)
+        except Exception as e:
+            frappe.log_error(f"Cover Image error for {src}: {str(e)}", "Wiki PDF Image Error")
             return src
 
     front_img = _get_base64_image("/files/CrecheFrontpage.jpg")
