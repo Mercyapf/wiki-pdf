@@ -51,6 +51,7 @@ def _find_page(route):
 
 def _inline_images(html):
     """Ensure images work in PDF by resolving local paths or inlining base64."""
+    if not html: return html
     soup = BeautifulSoup(html, "html.parser")
     for img in soup.find_all("img"):
         src = img.get("src")
@@ -61,23 +62,39 @@ def _inline_images(html):
 
         try:
             # Handle encoded URLs (spaces, etc.)
-            real_src = unquote(src)
+            real_src = unquote(src).strip()
             
-            # Try to resolve via find_file_by_url for any local-looking path
+            resolved_path = None
+            # 1. Try to resolve via find_file_by_url for any local-looking path
             if not real_src.startswith("http") or real_src.startswith(frappe.utils.get_url()):
                 # Get the path part (e.g., /files/foo.jpg)
                 url_path = urlparse(real_src).path
                 file_doc = find_file_by_url(url_path)
                 if file_doc and os.path.exists(file_doc.get_full_path()):
-                    img["src"] = os.path.abspath(file_doc.get_full_path())
-                    continue
+                    resolved_path = os.path.abspath(file_doc.get_full_path())
             
-            # Fallback for standard /files/ if find_file_by_url failed
-            if real_src.startswith("/files/"):
-                path = frappe.get_site_path("public", "files", real_src.split("/")[-1])
+            # 2. Fallback for standard /files/ if find_file_by_url failed
+            if not resolved_path and real_src.startswith("/files/"):
+                fname = real_src.split("/")[-1]
+                path = frappe.get_site_path("public", "files", fname)
                 if os.path.exists(path):
-                    img["src"] = os.path.abspath(path)
-                    continue
+                    resolved_path = os.path.abspath(path)
+                else:
+                    # Try direct site path if get_site_path/public/files is tricky
+                    alt_path = os.path.join(frappe.get_site_path(), "public", "files", fname)
+                    if os.path.exists(alt_path):
+                        resolved_path = os.path.abspath(alt_path)
+
+            if resolved_path:
+                # Use file:// prefix for absolute paths to be extremely clear for wkhtmltopdf
+                img["src"] = f"file://{resolved_path}"
+            else:
+                # If it's a relative path, maybe try to join with site path
+                if not real_src.startswith("/") and not real_src.startswith("http"):
+                    test_path = frappe.get_site_path("public", real_src)
+                    if os.path.exists(test_path):
+                        img["src"] = f"file://{os.path.abspath(test_path)}"
+
         except Exception as e:
             frappe.log_error(f"Image resolution error for {src}: {str(e)}", "Wiki PDF Image Error")
             img["src"] = fallback
@@ -166,13 +183,14 @@ TOC_STYLE = """
 <style>
     body { font-family: Georgia, serif; padding: 20mm; margin: 0; color: #111; }
     h1 { font-size: 24pt; font-weight: bold; border-bottom: 2px solid #333; padding-bottom: 10px; margin-bottom: 30px; }
-    .toc-item { font-size: 13pt; margin-bottom: 12px; clear: both; overflow: hidden; position: relative; }
-    .toc-title { float: left; background: white; padding-right: 5px; position: relative; z-index: 2; }
-    .toc-page { float: right; background: white; padding-left: 5px; position: relative; z-index: 2; font-weight: bold; color: #1a52a0; }
-    .dots { position: absolute; left: 0; right: 0; bottom: 6px; border-bottom: 1px solid #ccc; z-index: 1; }
-    .level-1 .dots { left: 25px; }
-    .level-0 { font-weight: bold; margin-top: 18px; color: #000; }
-    .level-1 { padding-left: 25px; color: #444; font-size: 11pt; }
+    .toc-container { display: table; width: 100%; border-spacing: 0 10pt; line-height: 1.2; }
+    .toc-item { display: table-row; }
+    /* width: 1% forces title to stay on one line unless it absolutely must wrap */
+    .toc-title { display: table-cell; padding-right: 5px; vertical-align: bottom; width: 1%; white-space: nowrap; }
+    .dots { display: table-cell; border-bottom: 1px solid #999; width: 100%; position: relative; top: -3pt; }
+    .toc-page { display: table-cell; padding-left: 10px; font-weight: bold; color: #1a52a0; text-align: right; vertical-align: bottom; white-space: nowrap; }
+    .level-0 .toc-title { font-weight: bold; font-size: 13pt; padding-top: 10pt; }
+    .level-1 .toc-title { padding-left: 20px; font-size: 11pt; color: #444; }
 </style>
 """
 
@@ -188,13 +206,11 @@ def _add_page_numbers(pdf_bin, skip_first=False, skip_last=False):
         reader = PdfReader(io.BytesIO(pdf_bin))
         total_pages = len(reader.pages)
 
-        # Build ONE html document with all footer pages (each 20mm tall, same as before)
-        # This replaces the old O(N) loop of pdfkit calls with a single call.
+        # Build ONE html document with all footer pages
         footer_divs = []
         for i in range(total_pages):
             page_break = "page-break-after:always;" if i < total_pages - 1 else ""
             if (skip_first and i == 0) or (skip_last and i == total_pages - 1):
-                # Empty placeholder page so page indices stay aligned
                 footer_divs.append(f'<div style="{page_break}width:210mm;height:20mm;"></div>')
             else:
                 page_num = i + 1
@@ -206,13 +222,12 @@ def _add_page_numbers(pdf_bin, skip_first=False, skip_last=False):
 
         all_footers_html = (
             "<html><head><meta charset='UTF-8'>"
-            "<style>body{margin:0;padding:0;background:transparent;}</style>"
+            "<style>body{{margin:0;padding:0;background:transparent !important;}}</style>"
             "</head><body>"
             + "".join(footer_divs)
             + "</body></html>"
         )
 
-        # ONE pdfkit call for all pages
         footer_pdf_bin = pdfkit.from_string(all_footers_html, False, options={
             "page-height": "20mm", "page-width": "210mm",
             "margin-top": "0", "margin-bottom": "0", "margin-left": "0", "margin-right": "0",
@@ -220,7 +235,6 @@ def _add_page_numbers(pdf_bin, skip_first=False, skip_last=False):
         })
 
         if not footer_pdf_bin:
-            frappe.log_error("Footer PDF generation returned empty", "Wiki PDF Error")
             return pdf_bin
 
         footer_reader = PdfReader(io.BytesIO(footer_pdf_bin))
@@ -228,7 +242,9 @@ def _add_page_numbers(pdf_bin, skip_first=False, skip_last=False):
 
         for i in range(total_pages):
             content_page = reader.pages[i]
-            if i < len(footer_reader.pages):
+            # CRITICAL: Don't merge if it's a skipped page (prevents white bar on covers)
+            is_skipped = (skip_first and i == 0) or (skip_last and i == total_pages - 1)
+            if not is_skipped and i < len(footer_reader.pages):
                 content_page.merge_page(footer_reader.pages[i])
             writer.add_page(content_page)
 
@@ -277,25 +293,20 @@ def _post_process_pdf(main_html, groups):
     <head>
         <meta charset='UTF-8'>
         <style>
-            html, body {{ margin: 0; padding: 0; width: 100%; height: 100%; }}
-            .cover-img {{ width: 100%; height: auto; display: block; }}
+            html, body {{ margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background-color: white; }}
+            .cover-img {{ width: 100%; height: 100%; display: block; margin: 0; padding: 0; border: none; }}
         </style>
     </head>
     <body style="margin: 0; padding: 0;">
-        <div style="width: 100%; height: 100%; overflow: hidden;">
-            <img src="/files/Creche Frontpage.jpg" style="width: 100%; height: auto; min-height: 100%; display: block; margin: 0 auto;">
-        </div>
+        <img src="/files/Creche Frontpage.jpg" class="cover-img">
     </body>
     </html>
     """
     cover_html = _inline_images(cover_html)
     
-    # Debug: Log if image path was resolved
-    if "files/" not in cover_html and "/files/" not in cover_html:
-        # This implies it was replaced by an absolute path or fallback
-        pass
-    else:
-        frappe.log_error("Cover image path might not have been resolved in _inline_images", "Wiki PDF Cover Error")
+    # Check if image was resolved
+    if "/files/Creche Frontpage.jpg" in cover_html:
+        frappe.log_error("Front cover image was NOT resolved to an absolute path", "Wiki PDF Cover Error")
 
     cover_pdf_bin = pdfkit.from_string(cover_html, False, options={
         "page-size": "A4", "margin-top": "0", "margin-bottom": "0", "margin-left": "0", "margin-right": "0",
@@ -303,12 +314,23 @@ def _post_process_pdf(main_html, groups):
     })
     
     # 3. Generate Back Cover PDF
-    back_html = _inline_images(f"""
+    back_html = f"""
     <html>
-    <head><meta charset='UTF-8'><style>html, body {{ margin: 0; padding: 0; width: 100%; height: 100%; }}</style></head>
-    <body style="margin: 0; padding: 0;"><div style="width: 100%; height: 100%; overflow: hidden;">
-        <img src="/files/creche backpage.jpg" style="width: 100%; height: auto; min-height: 100%; display: block; margin: 0 auto;">
-    </div></body></html>""")
+    <head>
+        <meta charset='UTF-8'>
+        <style>
+            html, body {{ margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background-color: white; }}
+            .cover-img {{ width: 100%; height: 100%; display: block; margin: 0; padding: 0; border: none; }}
+        </style>
+    </head>
+    <body style="margin: 0; padding: 0;">
+        <img src="/files/creche backpage.jpg" class="cover-img">
+    </body>
+    </html>
+    """
+    back_html = _inline_images(back_html)
+    if "/files/creche backpage.jpg" in back_html:
+        frappe.log_error("Back cover image was NOT resolved to an absolute path", "Wiki PDF Cover Error")
     back_pdf_bin = pdfkit.from_string(back_html, False, options={
         "page-size": "A4", "margin-top": "0", "margin-bottom": "0", "margin-left": "0", "margin-right": "0",
         "enable-local-file-access": "", "quiet": ""
@@ -339,11 +361,11 @@ def _post_process_pdf(main_html, groups):
         for g_idx, group in enumerate(groups):
             if group["label"]:
                 p_num = page_map.get(group["anchor"], 1) + shift
-                toc_lines.append(f'<div class="toc-item level-0"><span class="toc-title">{group["label"]}</span><span class="toc-page">{p_num}</span><div class="dots"></div></div>')
+                toc_lines.append(f'<div class="toc-item level-0"><span class="toc-title">{group["label"]}</span><div class="dots"></div><span class="toc-page">{p_num}</span></div>')
             for p_idx, page in enumerate(group["pages"]):
                 p_num = page_map.get(page["anchor"], 1) + shift
                 level = "level-1" if group["label"] else "level-0"
-                toc_lines.append(f'<div class="toc-item {level}"><span class="toc-title">{page["title"]}</span><span class="toc-page">{p_num}</span><div class="dots"></div></div>')
+                toc_lines.append(f'<div class="toc-item {level}"><span class="toc-title">{page["title"]}</span><div class="dots"></div><span class="toc-page">{p_num}</span></div>')
         toc_lines.append('</div>')
         return f"<html><head><meta charset='UTF-8'>{TOC_STYLE}</head><body>{''.join(toc_lines)}</body></html>"
 
