@@ -347,7 +347,7 @@ def _post_process_pdf(main_html, groups):
         # Return original if all else fails (wkhtmltopdf might still try to load it)
         return src
 
-    front_img = _get_base64_image("/files/Creche Frontpage.jpg")
+    front_img = _get_base64_image("/files/CrecheFrontpage.jpg")
     front_html = f"""
     <html>
     <head>
@@ -369,7 +369,7 @@ def _post_process_pdf(main_html, groups):
     })
     
     # 3. Generate Back Cover PDF
-    back_img = _get_base64_image("/files/creche backpage.jpg")
+    back_img = _get_base64_image("/files/crechebackpage.jpg")
     back_html = f"""
     <html>
     <head>
