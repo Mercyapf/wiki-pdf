@@ -303,16 +303,17 @@ def _post_process_pdf(main_html, groups):
     
     # 2. Generate Cover PDF
     def _get_base64_image(src):
-        """Helper to force base64 inlining for cloud reliability (covers)."""
+        """Ultra-robust helper for cloud reliability. Normalizes names and logs directory content on failure."""
         try:
             real_src = unquote(src).strip()
-            # If it's already base64, return it
             if real_src.startswith("data:"): return real_src
             
             fname = real_src.split("/")[-1]
+            # Normalize requested name for matching (lower, no spaces, no underscores)
+            norm_name = re.sub(r'[\s_]', '', fname).lower()
             path = None
             
-            # 1. Try find_file_by_url
+            # 1. Standard Frappe lookup
             try:
                 file_doc = find_file_by_url(real_src)
                 if file_doc:
@@ -322,16 +323,24 @@ def _post_process_pdf(main_html, groups):
             except: pass
 
             if not path:
-                # 2. Aggressive search in both public and private folders
+                # 2. Deep search in public/private folders
                 for folder in ["public", "private"]:
                     files_dir = frappe.get_site_path(folder, "files")
                     if os.path.exists(files_dir):
-                        # List all files and do a case-insensitive check
-                        for f in os.listdir(files_dir):
+                        all_files = os.listdir(files_dir)
+                        # First try exact case-insensitive match
+                        for f in all_files:
                             if f.lower() == fname.lower():
                                 path = os.path.join(files_dir, f)
                                 break
-                    if path: break
+                        if path: break
+                        
+                        # Then try normalized match (stripping spaces/underscores)
+                        for f in all_files:
+                            if re.sub(r'[\s_]', '', f).lower() == norm_name:
+                                path = os.path.join(files_dir, f)
+                                break
+                        if path: break
 
             if path and os.path.exists(path):
                 with open(path, "rb") as f:
@@ -339,13 +348,20 @@ def _post_process_pdf(main_html, groups):
                     ext = path.split(".")[-1].lower()
                     mime = "image/jpeg" if ext in ["jpg", "jpeg"] else "image/png"
                     return f"data:{mime};base64,{data}"
-            else:
-                frappe.log_error(f"Image NOT FOUND for {src}. Checked {fname} in public/private folders.", "Wiki PDF Cover Debug")
+            
+            # 3. CRITICAL FAILURE LOGGING: If we still can't find it, list the whole directory
+            debug_info = [f"Failed to find cover: {fname} (normalized: {norm_name})"]
+            for folder in ["public", "private"]:
+                files_dir = frappe.get_site_path(folder, "files")
+                if os.path.exists(files_dir):
+                    dfiles = os.listdir(files_dir)
+                    debug_info.append(f"Content of {folder}/files/ ({len(dfiles)} files): {', '.join(dfiles[:100])}")
+            
+            frappe.log_error("\n".join(debug_info), "Wiki PDF Cover Debug")
+            return src
         except Exception as e:
-            frappe.log_error(f"Cover image Base64 error for {src}: {str(e)}", "Wiki PDF Cover Error")
-        
-        # Return original if all else fails (wkhtmltopdf might still try to load it)
-        return src
+            frappe.log_error(f"Base64 Image error: {str(e)}", "Wiki PDF Image Error")
+            return src
 
     front_img = _get_base64_image("/files/CrecheFrontpage.jpg")
     front_html = f"""
