@@ -19,17 +19,29 @@ from frappe import _
 _MD_EXTRAS = ["tables", "fenced-code-blocks", "strike", "cuddled-lists", "break-on-newline", "header-ids", "footnotes"]
 
 def _md_to_html(text):
+    """Robust markdown to HTML conversion with table-hiding to avoid markdown2 crashes."""
     if not text: return ""
     try:
+        # Standard attempt
         return markdown2.markdown(text, extras=_MD_EXTRAS)
     except AssertionError:
-        # Known issue in markdown2 with malformed HTML blocks
-        # Fallback: Try without complex extras that often trigger the regex bug
+        # Markdown2 failed (likely due to a large HTML table). 
+        # Hide tables, parse the rest, then re-insert.
+        import re
+        tables = []
+        def _hide(match):
+            tables.append(match.group(0))
+            return f"\n\n---PDF_TABLE_HIDDEN_{len(tables)-1}---\n\n"
+        
+        hidden_md = re.sub(r'(<table[^>]*>.*?</table>)', _hide, text, flags=re.DOTALL | re.IGNORECASE)
         try:
-            simple_extras = [e for e in _MD_EXTRAS if e not in ["tables", "fenced-code-blocks"]]
-            return markdown2.markdown(text, extras=simple_extras)
+            html = markdown2.markdown(hidden_md, extras=_MD_EXTRAS)
+            for i, table_html in enumerate(tables):
+                placeholder = f"---PDF_TABLE_HIDDEN_{i}---"
+                html = html.replace(f"<p>{placeholder}</p>", table_html)
+                html = html.replace(placeholder, table_html)
+            return html
         except Exception:
-            # Last resort: just return text (potentially escaped)
             return f"<pre>{frappe.utils.escape_html(text)}</pre>"
     except Exception as e:
         frappe.log_error(f"Markdown parsing error: {str(e)}", "Wiki PDF Markdown Error")
@@ -401,11 +413,13 @@ def _post_process_pdf(main_html, groups):
         for g_idx, group in enumerate(groups):
             if group["label"]:
                 p_num = page_map.get(group["anchor"], 1) + shift
-                toc_lines.append(f'<div class="toc-item level-0"><span class="toc-page">{p_num}</span><span class="toc-title">{group["label"]}</span><div class="toc-line"></div></div>')
+                title = f"{group['number']}. {group['label']}"
+                toc_lines.append(f'<div class="toc-item level-0"><span class="toc-page">{p_num}</span><span class="toc-title">{title}</span><div class="toc-line"></div></div>')
             for p_idx, page in enumerate(group["pages"]):
                 p_num = page_map.get(page["anchor"], 1) + shift
+                title = f"{page['number']} {page['title']}"
                 level = "level-1" if group["label"] else "level-0"
-                toc_lines.append(f'<div class="toc-item {level}"><span class="toc-page">{p_num}</span><span class="toc-title">{page["title"]}</span><div class="toc-line"></div></div>')
+                toc_lines.append(f'<div class="toc-item {level}"><span class="toc-page">{p_num}</span><span class="toc-title">{title}</span><div class="toc-line"></div></div>')
         toc_lines.append('</div>')
         return f"<html><head><meta charset='UTF-8'>{TOC_STYLE}</head><body>{''.join(toc_lines)}</body></html>"
 
@@ -497,12 +511,25 @@ def download_wiki_pdf(page_name=None, route=None):
             p_names = [s.wiki_page for s in sidebar if s.wiki_page]
             p_map = {p.name: p for p in frappe.get_all("Wiki Page", filters={"name": ["in", p_names]}, fields=["name", "title", "content"], ignore_permissions=True, limit=0)}
 
+            group_counter = 1
             for s in sidebar:
                 if s.wiki_page in p_map:
                     p = p_map[s.wiki_page]
                     label = s.parent_label or ""
-                    if not groups or groups[-1]["label"] != label: groups.append({"label": label, "pages": []})
-                    groups[-1]["pages"].append({"title": p.title, "content_html": _clean_for_pdf(_md_to_html(p.content or ""))})
+                    
+                    if not groups or groups[-1]["label"] != label:
+                        groups.append({"label": label, "number": group_counter, "anchor": f"GTOC-{group_counter}", "pages": []})
+                        group_counter += 1
+                        ref_counter = 1
+                    
+                    full_number = f"{groups[-1]['number']}.{ref_counter}"
+                    groups[-1]["pages"].append({
+                        "number": full_number,
+                        "title": p.title,
+                        "anchor": f"PTOC-{full_number.replace('.', '-')}",
+                        "content_html": _clean_for_pdf(_md_to_html(p.content or ""))
+                    })
+                    ref_counter += 1
 
         if not groups or not any(g["pages"] for g in groups):
             frappe.throw(_("No content found to generate PDF"))
