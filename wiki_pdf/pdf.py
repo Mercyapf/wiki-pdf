@@ -293,30 +293,45 @@ def _post_process_pdf(main_html, groups):
         """Helper to force base64 inlining for cloud reliability (covers)."""
         try:
             real_src = unquote(src).strip()
+            # If it's already base64, return it
+            if real_src.startswith("data:"): return real_src
+            
             fname = real_src.split("/")[-1]
             path = None
             
             # 1. Try find_file_by_url
-            file_doc = find_file_by_url(real_src)
-            if file_doc and os.path.exists(file_doc.get_full_path()):
-                path = file_doc.get_full_path()
-            else:
-                # 2. Case-insensitive search in public/files
-                files_dir = frappe.get_site_path("public", "files")
-                if os.path.exists(files_dir):
-                    for f in os.listdir(files_dir):
-                        if f.lower() == fname.lower():
-                            path = os.path.join(files_dir, f)
-                            break
-            
+            try:
+                file_doc = find_file_by_url(real_src)
+                if file_doc:
+                    test_path = file_doc.get_full_path()
+                    if os.path.exists(test_path):
+                        path = test_path
+            except: pass
+
+            if not path:
+                # 2. Aggressive search in both public and private folders
+                for folder in ["public", "private"]:
+                    files_dir = frappe.get_site_path(folder, "files")
+                    if os.path.exists(files_dir):
+                        # List all files and do a case-insensitive check
+                        for f in os.listdir(files_dir):
+                            if f.lower() == fname.lower():
+                                path = os.path.join(files_dir, f)
+                                break
+                    if path: break
+
             if path and os.path.exists(path):
                 with open(path, "rb") as f:
                     data = base64.b64encode(f.read()).decode()
                     ext = path.split(".")[-1].lower()
                     mime = "image/jpeg" if ext in ["jpg", "jpeg"] else "image/png"
                     return f"data:{mime};base64,{data}"
-        except:
-            pass
+            else:
+                frappe.log_error(f"Image NOT FOUND for {src}. Checked {fname} in public/private folders.", "Wiki PDF Cover Debug")
+        except Exception as e:
+            frappe.log_error(f"Cover image Base64 error for {src}: {str(e)}", "Wiki PDF Cover Error")
+        
+        # Return original if all else fails (wkhtmltopdf might still try to load it)
         return src
 
     front_img = _get_base64_image("/files/Creche Frontpage.jpg")
