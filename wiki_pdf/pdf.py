@@ -305,40 +305,30 @@ def _post_process_pdf(main_html, groups):
     
     # 2. Generate Cover PDF
     def _get_base64_image(src):
-        """Universal 'Local File' Cloud Resolution: Content API -> Temp File -> file:// path."""
+        """Robust Cloud Resolution: Content API -> Base64 (Transparent for S3/CDN)."""
         try:
             real_src = unquote(src).strip()
             if real_src.startswith("data:"): return real_src
             
-            # 1. Flexible Lookup (Unified ChatGPT + Robust Logic)
+            # 1. Flexible Lookup (URL or Name)
             fname = real_src.split("/")[-1]
-            file_name_db = frappe.db.get_value("File", {"file_url": real_src}, "name")
-            if not file_name_db:
-                # Try by filename as a backup (handles space/naming mismatches)
-                file_name_db = frappe.db.get_value("File", {"file_name": ["like", f"%{fname}%"]}, "name")
+            f_name = frappe.db.get_value("File", {"file_url": real_src}, "name")
+            if not f_name:
+                f_name = frappe.db.get_value("File", {"file_name": ["like", f"%{fname}%"]}, "name")
             
-            if file_name_db:
-                file_doc = frappe.get_doc("File", file_name_db)
-                # get_content() is the "Holy Grail" for Frappe Cloud/S3
-                content = file_doc.get_content()
+            if f_name:
+                f_doc = frappe.get_doc("File", f_name)
+                # get_content() fetches from S3 or Disk automatically
+                content = f_doc.get_content()
                 if content:
-                    # Write to a temporary file (bypasses SSL, Networking, and Base64 size issues)
-                    ext = "." + file_doc.file_name.split(".")[-1].lower() if "." in file_doc.file_name else ".jpg"
-                    # Using a stable /tmp path for wkhtmltopdf access
-                    tmp_path = os.path.join(tempfile.gettempdir(), f"wiki_cov_{file_name_db[:10]}{ext}")
-                    with open(tmp_path, "wb") as f:
-                        f.write(content)
-                    
-                    res = f"file://{tmp_path}"
-                    # Debug Log
-                    frappe.log_error(res, "FRONT IMAGE FILE")
-                    return res
+                    encoded = base64.b64encode(content).decode()
+                    mime = "image/jpeg" if f_doc.file_name.lower().endswith((".jpg", ".jpeg")) else "image/png"
+                    return f"data:{mime};base64,{encoded}"
             
-            # 2. Last resort fallback to URL
+            # 2. Fallback to Full URL
             return frappe.utils.get_url(real_src)
-        except Exception as e:
-            frappe.log_error(f"Cover Image error for {src}: {str(e)}", "Wiki PDF Image Error")
-            return src
+        except Exception:
+            return frappe.utils.get_url(src)
 
     front_img = _get_base64_image("/files/CrecheFrontpage.jpg")
     front_html = f"""
@@ -346,13 +336,11 @@ def _post_process_pdf(main_html, groups):
     <head>
         <meta charset='UTF-8'>
         <style>
-            html, body {{ margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background-color: white; }}
-            .cover-img {{ width: 100%; height: 100%; display: block; margin: 0; padding: 0; border: none; }}
+            html, body {{ margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background-color: white; font-family: sans-serif; }}
+            .cover-img {{ width: 100%; height: 100%; object-fit: cover; display: block; border: none; }}
         </style>
     </head>
-    <body style="margin: 0; padding: 0;">
-        <img src="{front_img}" class="cover-img" onerror="this.style.display='none'">
-    </body>
+    <body><img src="{front_img}" class="cover-img"></body>
     </html>
     """
     
@@ -362,27 +350,32 @@ def _post_process_pdf(main_html, groups):
         "enable-javascript": "", "no-stop-slow-scripts": "", "quiet": ""
     })
     
-    # 3. Generate Back Cover PDF
     back_img = _get_base64_image("/files/crechebackpage.jpg")
     back_html = f"""
     <html>
     <head>
         <meta charset='UTF-8'>
         <style>
-            html, body {{ margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background-color: white; }}
-            .cover-img {{ width: 100%; height: 100%; display: block; margin: 0; padding: 0; border: none; }}
+            html, body {{ margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background-color: white; font-family: sans-serif; }}
+            .cover-img {{ width: 100%; height: 100%; object-fit: cover; display: block; border: none; }}
         </style>
     </head>
-    <body style="margin: 0; padding: 0;">
-        <img src="{back_img}" class="cover-img">
-    </body>
+    <body style="margin: 0; padding: 0;"><img src="{back_img}" class="cover-img"></body>
     </html>
     """
-    back_pdf_bin = pdfkit.from_string(back_html, False, options={
+    
+    # 4. Custom PDF Options for maximum Cloud support
+    COVER_OPTS = {
         "page-size": "A4", "margin-top": "0", "margin-bottom": "0", "margin-left": "0", "margin-right": "0",
+        "encoding": "UTF-8", "quiet": "", "no-outline": "", 
         "enable-local-file-access": "", "enable-external-links": "", 
-        "enable-javascript": "", "no-stop-slow-scripts": "", "quiet": ""
-    })
+        "enable-javascript": "", "no-stop-slow-scripts": "",
+        "custom-header": [("User-Agent", "Mozilla/5.0")], "custom-header-propagation": "",
+        "load-error-handling": "ignore", "load-media-error-handling": "ignore"
+    }
+
+    cover_pdf_bin = pdfkit.from_string(front_html, False, options=COVER_OPTS)
+    back_pdf_bin = pdfkit.from_string(back_html, False, options=COVER_OPTS)
 
     # 4. Generate content PDF
     content_pdf = pdfkit.from_string(content_html, False, options=_pdf_options(None))
