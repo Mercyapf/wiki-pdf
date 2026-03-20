@@ -6,6 +6,7 @@ import os
 import re
 import tempfile
 import io
+import urllib.request
 from bs4 import BeautifulSoup
 from pypdf import PdfReader, PdfWriter
 from frappe.core.doctype.file.utils import find_file_by_url
@@ -304,22 +305,19 @@ def _post_process_pdf(main_html, groups):
     
     # 2. Generate Cover PDF
     def _get_base64_image(src):
-        """Ultra-robust helper for cloud reliability. Normalizes names and logs directory content on failure."""
+        """Ultra-robust helper for cloud reliability. Database -> Disk -> HTTP Fallback."""
         try:
             real_src = unquote(src).strip()
             if real_src.startswith("data:"): return real_src
             
             fname = real_src.split("/")[-1]
-            # Normalize requested name for matching (lower, no spaces, no underscores)
             norm_name = re.sub(r'[\s_]', '', fname).lower()
             path = None
             
-            # 1. Database Search (Most reliable for cloud)
+            # 1. Database Search (frappe standard)
             try:
-                # Try exact match first
                 file_list = frappe.get_all("File", filters={"file_url": ["like", f"%{fname}%"]}, fields=["name"], limit=5)
                 if not file_list:
-                    # Try normalized name match
                     file_list = frappe.get_all("File", filters={"file_name": ["like", f"%{norm_name}%"]}, fields=["name"], limit=5)
                 
                 for fdoc in file_list:
@@ -330,55 +328,48 @@ def _post_process_pdf(main_html, groups):
                         break
             except: pass
 
-            # 2. Standard direct URL lookup
+            # 2. Filesystem Scan (direct)
             if not path:
-                try:
-                    file_doc = find_file_by_url(real_src)
-                    if file_doc:
-                        test_path = file_doc.get_full_path()
-                        if os.path.exists(test_path):
-                            path = test_path
-                except: pass
-
-            if not path:
-                # 3. Deep search in public/private folders
                 for folder in ["public", "private"]:
                     files_dir = frappe.get_site_path(folder, "files")
                     if os.path.exists(files_dir):
                         all_files = os.listdir(files_dir)
-                        # First try exact case-insensitive match
                         for f in all_files:
-                            if f.lower() == fname.lower():
+                            if f.lower() == fname.lower() or re.sub(r'[\s_]', '', f).lower() == norm_name:
                                 path = os.path.join(files_dir, f)
                                 break
-                        if path: break
-                        
-                        # Then try normalized match (stripping spaces/underscores)
-                        for f in all_files:
-                            if re.sub(r'[\s_]', '', f).lower() == norm_name:
-                                path = os.path.join(files_dir, f)
-                                break
-                        if path: break
+                    if path: break
 
+            # 3. Read File or Fallback to HTTP
             if path and os.path.exists(path):
+                ext = path.split(".")[-1].lower()
+                mime = "image/jpeg" if ext in ["jpg", "jpeg"] else "image/png"
                 with open(path, "rb") as f:
                     data = base64.b64encode(f.read()).decode()
-                    ext = path.split(".")[-1].lower()
-                    mime = "image/jpeg" if ext in ["jpg", "jpeg"] else "image/png"
-                    return f"data:{mime};base64,{data}"
+                return f"data:{mime};base64,{data}"
             
-            # 3. CRITICAL FAILURE LOGGING: If we still can't find it, list the whole directory
-            debug_info = [f"Failed to find cover: {fname} (normalized: {norm_name})"]
-            for folder in ["public", "private"]:
-                files_dir = frappe.get_site_path(folder, "files")
-                if os.path.exists(files_dir):
-                    dfiles = os.listdir(files_dir)
-                    debug_info.append(f"Content of {folder}/files/ ({len(dfiles)} files): {', '.join(dfiles[:100])}")
+            # 4. CLOUD FALLBACK: HTTP Fetch (for S3/CDN-backed sites)
+            site_url = frappe.utils.get_url()
+            fetch_url = f"{site_url}{real_src}" if real_src.startswith("/") else real_src
+            if "://" not in fetch_url: fetch_url = f"{site_url}/files/{fname}"
             
-            frappe.log_error("\n".join(debug_info), "Wiki PDF Cover Debug")
-            return src
+            # Debug info for log
+            debug_info = [
+                f"Local path FAILED for {fname} (normalized: {norm_name})",
+                f"Attempting HTTP fetch: {fetch_url}",
+                f"Site path: {frappe.get_site_path()}"
+            ]
+            frappe.log_error("\n".join(debug_info), "Wiki PDF Cover Fallback")
+            
+            req = urllib.request.Request(fetch_url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                raw = resp.read()
+                mime = resp.headers.get("Content-Type", "image/jpeg").split(";")[0].strip()
+                data = base64.b64encode(raw).decode()
+                return f"data:{mime};base64,{data}"
+
         except Exception as e:
-            frappe.log_error(f"Base64 Image error: {str(e)}", "Wiki PDF Image Error")
+            frappe.log_error(f"Base64 Image error for {src}: {str(e)}", "Wiki PDF Image Error")
             return src
 
     front_img = _get_base64_image("/files/CrecheFrontpage.jpg")
