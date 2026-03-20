@@ -293,7 +293,8 @@ def _post_process_pdf(main_html, groups):
             # If we already had a group label/header, we don't need another break for the first page
             pb = 'style="page-break-before:always;"' if (p_idx > 0 or (g_idx > 0 and not group["label"])) else ""
             tag = "h2" if group["label"] else "h1"
-            parts.append(f'<div {pb}>{p_div}<{tag} class="page-title">{page["title"]}</{tag}>{page["content_html"]}</div>')
+            title_with_num = f"{page['number']} {page['title']}" if page.get("number") else page["title"]
+            parts.append(f'<div {pb}>{p_div}<{tag} class="page-title">{title_with_num}</{tag}>{page["content_html"]}</div>')
         
         parts.append('</div>')
         anchor_html.append("\n".join(parts))
@@ -313,17 +314,34 @@ def _post_process_pdf(main_html, groups):
             norm_name = re.sub(r'[\s_]', '', fname).lower()
             path = None
             
-            # 1. Standard Frappe lookup
+            # 1. Database Search (Most reliable for cloud)
             try:
-                file_doc = find_file_by_url(real_src)
-                if file_doc:
-                    test_path = file_doc.get_full_path()
+                # Try exact match first
+                file_list = frappe.get_all("File", filters={"file_url": ["like", f"%{fname}%"]}, fields=["name"], limit=5)
+                if not file_list:
+                    # Try normalized name match
+                    file_list = frappe.get_all("File", filters={"file_name": ["like", f"%{norm_name}%"]}, fields=["name"], limit=5)
+                
+                for fdoc in file_list:
+                    doc = frappe.get_doc("File", fdoc.name)
+                    test_path = doc.get_full_path()
                     if os.path.exists(test_path):
                         path = test_path
+                        break
             except: pass
 
+            # 2. Standard direct URL lookup
             if not path:
-                # 2. Deep search in public/private folders
+                try:
+                    file_doc = find_file_by_url(real_src)
+                    if file_doc:
+                        test_path = file_doc.get_full_path()
+                        if os.path.exists(test_path):
+                            path = test_path
+                except: pass
+
+            if not path:
+                # 3. Deep search in public/private folders
                 for folder in ["public", "private"]:
                     files_dir = frappe.get_site_path(folder, "files")
                     if os.path.exists(files_dir):
