@@ -305,31 +305,35 @@ def _post_process_pdf(main_html, groups):
     
     # 2. Generate Cover PDF
     def _get_base64_image(src):
-        """Final Simplified Cloud Resolution: Base64 (Local) -> Full URL (External) fallback."""
+        """Final 'Holy Grail' Cloud Resolution: Using Frappe's get_content() API (S3/CDN safe)."""
         try:
             real_src = unquote(src).strip()
             if real_src.startswith("data:"): return real_src
             
-            # 1. Try Base64 via Database lookup (Highest reliability)
+            # 1. Flexible Lookup (Unified ChatGPT + Robust Logic)
             fname = real_src.split("/")[-1]
-            file_name = frappe.db.get_value("File", {"file_url": real_src}, "name")
-            if not file_name:
-                # Try by filename as a backup
-                file_name = frappe.db.get_value("File", {"file_name": ["like", f"%{fname}%"]}, "name")
+            file_name_db = frappe.db.get_value("File", {"file_url": real_src}, "name")
+            if not file_name_db:
+                # Try by filename as a backup (handles space/naming mismatches)
+                file_name_db = frappe.db.get_value("File", {"file_name": ["like", f"%{fname}%"]}, "name")
             
-            if file_name:
-                doc = frappe.get_doc("File", file_name)
-                path = doc.get_full_path()
-                if os.path.exists(path):
-                    with open(path, "rb") as f:
-                        data = base64.b64encode(f.read()).decode()
-                        mime = "image/jpeg" if path.lower().endswith((".jpg", ".jpeg")) else "image/png"
-                        return f"data:{mime};base64,{data}"
+            if file_name_db:
+                file_doc = frappe.get_doc("File", file_name_db)
+                # get_content() is the "Holy Grail" for Frappe Cloud/S3 (NOT using local paths)
+                content = file_doc.get_content()
+                if content:
+                    encoded = base64.b64encode(content).decode()
+                    mime = "image/jpeg" if file_doc.file_name.lower().endswith((".jpg", ".jpeg")) else "image/png"
+                    res = f"data:{mime};base64,{encoded}"
+                    # Debug Log as requested by ChatGPT
+                    frappe.log_error(f"Image {fname}: {res[:100]}...", "FRONT IMAGE BASE64")
+                    return res
             
-            # 2. Fallback to Full External URL (as suggested by ChatGPT/Claude)
+            # 2. Last resort fallback to URL
             return frappe.utils.get_url(real_src)
-        except Exception:
-            return frappe.utils.get_url(src)
+        except Exception as e:
+            frappe.log_error(f"Base64 Image error for {src}: {str(e)}", "Wiki PDF Image Error")
+            return src
 
     front_img = _get_base64_image("/files/CrecheFrontpage.jpg")
     front_html = f"""
@@ -342,14 +346,14 @@ def _post_process_pdf(main_html, groups):
         </style>
     </head>
     <body style="margin: 0; padding: 0;">
-        <img src="{front_img}" class="cover-img">
+        <img src="{front_img}" class="cover-img" onerror="this.style.display='none'">
     </body>
     </html>
     """
     
     cover_pdf_bin = pdfkit.from_string(front_html, False, options={
         "page-size": "A4", "margin-top": "0", "margin-bottom": "0", "margin-left": "0", "margin-right": "0",
-        "enable-local-file-access": "", "quiet": ""
+        "enable-local-file-access": "", "enable-external-links": "", "quiet": ""
     })
     
     # 3. Generate Back Cover PDF
@@ -364,13 +368,13 @@ def _post_process_pdf(main_html, groups):
         </style>
     </head>
     <body style="margin: 0; padding: 0;">
-        <img src="{back_img}" class="cover-img">
+        <img src="{back_img}" class="cover-img" onerror="this.style.display='none'">
     </body>
     </html>
     """
     back_pdf_bin = pdfkit.from_string(back_html, False, options={
         "page-size": "A4", "margin-top": "0", "margin-bottom": "0", "margin-left": "0", "margin-right": "0",
-        "enable-local-file-access": "", "quiet": ""
+        "enable-local-file-access": "", "enable-external-links": "", "quiet": ""
     })
 
     # 4. Generate content PDF
