@@ -305,72 +305,31 @@ def _post_process_pdf(main_html, groups):
     
     # 2. Generate Cover PDF
     def _get_base64_image(src):
-        """Ultra-robust helper for cloud reliability. Database -> Disk -> HTTP Fallback."""
+        """Final Simplified Cloud Resolution: Base64 (Local) -> Full URL (External) fallback."""
         try:
             real_src = unquote(src).strip()
             if real_src.startswith("data:"): return real_src
             
+            # 1. Try Base64 via Database lookup (Highest reliability)
             fname = real_src.split("/")[-1]
-            norm_name = re.sub(r'[\s_]', '', fname).lower()
-            path = None
+            file_name = frappe.db.get_value("File", {"file_url": real_src}, "name")
+            if not file_name:
+                # Try by filename as a backup
+                file_name = frappe.db.get_value("File", {"file_name": ["like", f"%{fname}%"]}, "name")
             
-            # 1. Database Search (frappe standard)
-            try:
-                file_list = frappe.get_all("File", filters={"file_url": ["like", f"%{fname}%"]}, fields=["name"], limit=5)
-                if not file_list:
-                    file_list = frappe.get_all("File", filters={"file_name": ["like", f"%{norm_name}%"]}, fields=["name"], limit=5)
-                
-                for fdoc in file_list:
-                    doc = frappe.get_doc("File", fdoc.name)
-                    test_path = doc.get_full_path()
-                    if os.path.exists(test_path):
-                        path = test_path
-                        break
-            except: pass
-
-            # 2. Filesystem Scan (direct)
-            if not path:
-                for folder in ["public", "private"]:
-                    files_dir = frappe.get_site_path(folder, "files")
-                    if os.path.exists(files_dir):
-                        all_files = os.listdir(files_dir)
-                        for f in all_files:
-                            if f.lower() == fname.lower() or re.sub(r'[\s_]', '', f).lower() == norm_name:
-                                path = os.path.join(files_dir, f)
-                                break
-                    if path: break
-
-            # 3. Read File or Fallback to HTTP
-            if path and os.path.exists(path):
-                ext = path.split(".")[-1].lower()
-                mime = "image/jpeg" if ext in ["jpg", "jpeg"] else "image/png"
-                with open(path, "rb") as f:
-                    data = base64.b64encode(f.read()).decode()
-                return f"data:{mime};base64,{data}"
+            if file_name:
+                doc = frappe.get_doc("File", file_name)
+                path = doc.get_full_path()
+                if os.path.exists(path):
+                    with open(path, "rb") as f:
+                        data = base64.b64encode(f.read()).decode()
+                        mime = "image/jpeg" if path.lower().endswith((".jpg", ".jpeg")) else "image/png"
+                        return f"data:{mime};base64,{data}"
             
-            # 4. CLOUD FALLBACK: HTTP Fetch (for S3/CDN-backed sites)
-            site_url = frappe.utils.get_url()
-            fetch_url = f"{site_url}{real_src}" if real_src.startswith("/") else real_src
-            if "://" not in fetch_url: fetch_url = f"{site_url}/files/{fname}"
-            
-            # Debug info for log
-            debug_info = [
-                f"Local path FAILED for {fname} (normalized: {norm_name})",
-                f"Attempting HTTP fetch: {fetch_url}",
-                f"Site path: {frappe.get_site_path()}"
-            ]
-            frappe.log_error("\n".join(debug_info), "Wiki PDF Cover Fallback")
-            
-            req = urllib.request.Request(fetch_url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                raw = resp.read()
-                mime = resp.headers.get("Content-Type", "image/jpeg").split(";")[0].strip()
-                data = base64.b64encode(raw).decode()
-                return f"data:{mime};base64,{data}"
-
-        except Exception as e:
-            frappe.log_error(f"Base64 Image error for {src}: {str(e)}", "Wiki PDF Image Error")
-            return src
+            # 2. Fallback to Full External URL (as suggested by ChatGPT/Claude)
+            return frappe.utils.get_url(real_src)
+        except Exception:
+            return frappe.utils.get_url(src)
 
     front_img = _get_base64_image("/files/CrecheFrontpage.jpg")
     front_html = f"""
@@ -508,6 +467,7 @@ def _pdf_options(footer_path, toc_xsl_path=None):
     opts = {
         "page-size": "A4", "margin-top": "15mm", "margin-bottom": "18mm", "margin-left": "18mm", "margin-right": "18mm",
         "encoding": "UTF-8", "quiet": "", "enable-local-file-access": "", 
+        "enable-external-links": "", "no-stop-slow-scripts": "",
         "load-error-handling": "ignore", "load-media-error-handling": "ignore"
     }
     return opts
