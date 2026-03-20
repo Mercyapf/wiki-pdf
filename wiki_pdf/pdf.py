@@ -183,14 +183,15 @@ TOC_STYLE = """
 <style>
     body { font-family: Georgia, serif; padding: 20mm; margin: 0; color: #111; }
     h1 { font-size: 24pt; font-weight: bold; border-bottom: 2px solid #333; padding-bottom: 10px; margin-bottom: 30px; }
-    .toc-container { display: table; width: 100%; border-spacing: 0 10pt; line-height: 1.2; }
-    .toc-item { display: table-row; }
-    /* width: 1% forces title to stay on one line unless it absolutely must wrap */
-    .toc-title { display: table-cell; padding-right: 5px; vertical-align: bottom; width: 1%; white-space: nowrap; }
-    .dots { display: table-cell; border-bottom: 1px solid #999; width: 100%; position: relative; top: -3pt; }
-    .toc-page { display: table-cell; padding-left: 10px; font-weight: bold; color: #1a52a0; text-align: right; vertical-align: bottom; white-space: nowrap; }
-    .level-0 .toc-title { font-weight: bold; font-size: 13pt; padding-top: 10pt; }
-    .level-1 .toc-title { padding-left: 20px; font-size: 11pt; color: #444; }
+    .toc-container { width: 100%; }
+    .toc-item { clear: both; overflow: hidden; margin-bottom: 12pt; line-height: 1.2; }
+    .toc-title { float: left; white-space: nowrap; padding-right: 5px; }
+    .toc-page { float: right; white-space: nowrap; padding-left: 5px; font-weight: bold; color: #1a52a0; }
+    /* This block fills the exactly gap between the floating title and floating page number */
+    .toc-line { overflow: hidden; border-bottom: 1px solid #999; height: 1.0em; }
+    .level-0 .toc-title { font-weight: bold; font-size: 13pt; }
+    .level-1 { padding-left: 25px; }
+    .level-1 .toc-title { font-size: 11pt; color: #444; }
 </style>
 """
 
@@ -288,7 +289,38 @@ def _post_process_pdf(main_html, groups):
     content_html = _inline_images(_wrap(full_body))
     
     # 2. Generate Cover PDF
-    cover_html = f"""
+    def _get_base64_image(src):
+        """Helper to force base64 inlining for cloud reliability (covers)."""
+        try:
+            real_src = unquote(src).strip()
+            fname = real_src.split("/")[-1]
+            path = None
+            
+            # 1. Try find_file_by_url
+            file_doc = find_file_by_url(real_src)
+            if file_doc and os.path.exists(file_doc.get_full_path()):
+                path = file_doc.get_full_path()
+            else:
+                # 2. Case-insensitive search in public/files
+                files_dir = frappe.get_site_path("public", "files")
+                if os.path.exists(files_dir):
+                    for f in os.listdir(files_dir):
+                        if f.lower() == fname.lower():
+                            path = os.path.join(files_dir, f)
+                            break
+            
+            if path and os.path.exists(path):
+                with open(path, "rb") as f:
+                    data = base64.b64encode(f.read()).decode()
+                    ext = path.split(".")[-1].lower()
+                    mime = "image/jpeg" if ext in ["jpg", "jpeg"] else "image/png"
+                    return f"data:{mime};base64,{data}"
+        except:
+            pass
+        return src
+
+    front_img = _get_base64_image("/files/Creche Frontpage.jpg")
+    front_html = f"""
     <html>
     <head>
         <meta charset='UTF-8'>
@@ -298,22 +330,18 @@ def _post_process_pdf(main_html, groups):
         </style>
     </head>
     <body style="margin: 0; padding: 0;">
-        <img src="/files/Creche Frontpage.jpg" class="cover-img">
+        <img src="{front_img}" class="cover-img">
     </body>
     </html>
     """
-    cover_html = _inline_images(cover_html)
     
-    # Check if image was resolved
-    if "/files/Creche Frontpage.jpg" in cover_html:
-        frappe.log_error("Front cover image was NOT resolved to an absolute path", "Wiki PDF Cover Error")
-
-    cover_pdf_bin = pdfkit.from_string(cover_html, False, options={
+    cover_pdf_bin = pdfkit.from_string(front_html, False, options={
         "page-size": "A4", "margin-top": "0", "margin-bottom": "0", "margin-left": "0", "margin-right": "0",
         "enable-local-file-access": "", "quiet": ""
     })
     
     # 3. Generate Back Cover PDF
+    back_img = _get_base64_image("/files/creche backpage.jpg")
     back_html = f"""
     <html>
     <head>
@@ -324,13 +352,10 @@ def _post_process_pdf(main_html, groups):
         </style>
     </head>
     <body style="margin: 0; padding: 0;">
-        <img src="/files/creche backpage.jpg" class="cover-img">
+        <img src="{back_img}" class="cover-img">
     </body>
     </html>
     """
-    back_html = _inline_images(back_html)
-    if "/files/creche backpage.jpg" in back_html:
-        frappe.log_error("Back cover image was NOT resolved to an absolute path", "Wiki PDF Cover Error")
     back_pdf_bin = pdfkit.from_string(back_html, False, options={
         "page-size": "A4", "margin-top": "0", "margin-bottom": "0", "margin-left": "0", "margin-right": "0",
         "enable-local-file-access": "", "quiet": ""
@@ -361,11 +386,11 @@ def _post_process_pdf(main_html, groups):
         for g_idx, group in enumerate(groups):
             if group["label"]:
                 p_num = page_map.get(group["anchor"], 1) + shift
-                toc_lines.append(f'<div class="toc-item level-0"><span class="toc-title">{group["label"]}</span><div class="dots"></div><span class="toc-page">{p_num}</span></div>')
+                toc_lines.append(f'<div class="toc-item level-0"><span class="toc-page">{p_num}</span><span class="toc-title">{group["label"]}</span><div class="toc-line"></div></div>')
             for p_idx, page in enumerate(group["pages"]):
                 p_num = page_map.get(page["anchor"], 1) + shift
                 level = "level-1" if group["label"] else "level-0"
-                toc_lines.append(f'<div class="toc-item {level}"><span class="toc-title">{page["title"]}</span><div class="dots"></div><span class="toc-page">{p_num}</span></div>')
+                toc_lines.append(f'<div class="toc-item {level}"><span class="toc-page">{p_num}</span><span class="toc-title">{page["title"]}</span><div class="toc-line"></div></div>')
         toc_lines.append('</div>')
         return f"<html><head><meta charset='UTF-8'>{TOC_STYLE}</head><body>{''.join(toc_lines)}</body></html>"
 
