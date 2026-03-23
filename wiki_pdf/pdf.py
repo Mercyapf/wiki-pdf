@@ -305,39 +305,45 @@ def _post_process_pdf(main_html, groups):
     full_body = "\n".join(anchor_html)
     content_html = _inline_images(_wrap(full_body))
     
-    # 2. Generate Cover & Title Pages
-    # For Frappe Cloud, we use frappe.utils.pdf.get_pdf for the most robust image handling
+    # 2. Generate Cover & Title Pages (Cloud-Compatible Final Shot)
     from frappe.utils.pdf import get_pdf
     
-    # Page 1: Image Cover
-    image_url = frappe.utils.get_url("/files/CrecheFrontpage.jpg")
-    image_html = f"""
-    <html>
-    <head><meta charset='UTF-8'><style>
-        html, body {{ margin: 0; padding: 0; width: 100%; height: 100%; }}
-        .cover-img {{ width: 100%; height: 100%; object-fit: cover; display: block; }}
-    </style></head>
-    <body><img src="{image_url}" class="cover-img"></body>
-    </html>
-    """
+    # Page 1: Image Cover (Using get_content() + Base64 for 100% reliability on S3/Cloud)
+    cover_pdf_bin = None
+    f_name = frappe.db.get_value("File", {"file_url": "/files/CrecheFrontpage.jpg"}, "name")
+    if not f_name:
+        f_name = frappe.db.get_value("File", {"file_name": ["like", "%CrecheFrontpage%"]}, "name")
     
-    # Page 2: Text Title
+    if f_name:
+        f_doc = frappe.get_doc("File", f_name)
+        content = f_doc.get_content()
+        if content:
+            encoded = base64.b64encode(content).decode()
+            mime = "image/jpeg" if f_doc.file_name.lower().endswith((".jpg", ".jpeg")) else "image/png"
+            image_html = f"""
+            <html><head><meta charset='UTF-8'><style>
+                html, body {{ margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background-color: white; }}
+                table {{ width: 100%; height: 100%; border-collapse: collapse; }}
+                td {{ margin: 0; padding: 0; vertical-align: middle; text-align: center; }}
+                img {{ width: auto; height: 100%; display: block; margin: 0 auto; }}
+            </style></head>
+            <body><table><tr><td><img src="data:{mime};base64,{encoded}"></td></tr></table></body>
+            </html>
+            """
+            cover_pdf_bin = get_pdf(image_html, options={"page-size": "A4", "margin-top": "0", "margin-bottom": "0", "margin-left": "0", "margin-right": "0", "quiet": ""})
+
+    # Page 2: Text Title (Using Table-based centering for older Cloud engines)
     title_html = """
-    <html>
-    <head><meta charset='UTF-8'><style>
-        html, body { margin: 0; padding: 0; width: 100%; height: 100%; display: flex; justify-content: center; align-items: center; background-color: white; }
-        .title-card { text-align: center; font-family: Georgia, serif; font-size: 36pt; font-weight: bold; }
+    <html><head><meta charset='UTF-8'><style>
+        html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background-color: white; }
+        table { width: 100%; height: 100%; border-collapse: collapse; border: none; }
+        td { vertical-align: middle; text-align: center; font-family: Georgia, serif; font-size: 36pt; font-weight: bold; }
     </style></head>
     <body style="margin: 0; padding: 0;">
-        <div style="width: 100%; height: 297mm; display: flex; justify-content: center; align-items: center;">
-            <div class="title-card">Creche Guidelines</div>
-        </div>
+        <table><tr><td>Creche Guidelines</td></tr></table>
     </body>
     </html>
     """
-    
-    # Generate Cover/Title binaries (using Frappe's utility for Cloud compatibility)
-    cover_pdf_bin = get_pdf(image_html, options={"page-size": "A4", "margin-top": "0", "margin-bottom": "0", "margin-left": "0", "margin-right": "0", "quiet": ""})
     title_pdf_bin = get_pdf(title_html, options={"page-size": "A4", "margin-top": "0", "margin-bottom": "0", "margin-left": "0", "margin-right": "0", "quiet": ""})
 
     # 3. Generate content PDF
