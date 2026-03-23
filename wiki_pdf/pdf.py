@@ -215,7 +215,7 @@ FOOTER_STYLE = """
 </style>
 """
 
-def _add_page_numbers(pdf_bin, skip_first=False, skip_last=False):
+def _add_page_numbers(pdf_bin, skip_first=False, skip_last=False, skip_count=1):
     """Adds page numbers using a single pdfkit call for all pages (prevents worker timeout on large docs)."""
     try:
         reader = PdfReader(io.BytesIO(pdf_bin))
@@ -225,9 +225,11 @@ def _add_page_numbers(pdf_bin, skip_first=False, skip_last=False):
         footer_divs = []
         for i in range(total_pages):
             page_break = "page-break-after:always;" if i < total_pages - 1 else ""
-            if (skip_first and i == 0) or (skip_last and i == total_pages - 1):
+            if (skip_first and i < skip_count) or (skip_last and i == total_pages - 1):
                 footer_divs.append(f'<div style="{page_break}width:210mm;height:20mm;"></div>')
             else:
+                # Adjust numbering so TOC (page 3) starts at a logical number if needed, 
+                # but currently we just use the literal index + 1
                 page_num = i + 1
                 footer_divs.append(
                     f'<div style="{page_break}width:210mm;height:20mm;position:relative;font-family:Georgia,serif;font-size:10pt;">'
@@ -303,81 +305,42 @@ def _post_process_pdf(main_html, groups):
     full_body = "\n".join(anchor_html)
     content_html = _inline_images(_wrap(full_body))
     
-    # 2. Generate Cover PDF
-    def _get_base64_image(src):
-        """Robust Cloud Resolution: Content API -> Base64 (Transparent for S3/CDN)."""
-        try:
-            real_src = unquote(src).strip()
-            if real_src.startswith("data:"): return real_src
-            
-            # 1. Flexible Lookup (URL or Name)
-            fname = real_src.split("/")[-1]
-            f_name = frappe.db.get_value("File", {"file_url": real_src}, "name")
-            if not f_name:
-                f_name = frappe.db.get_value("File", {"file_name": ["like", f"%{fname}%"]}, "name")
-            
-            if f_name:
-                f_doc = frappe.get_doc("File", f_name)
-                # get_content() fetches from S3 or Disk automatically
-                content = f_doc.get_content()
-                if content:
-                    encoded = base64.b64encode(content).decode()
-                    mime = "image/jpeg" if f_doc.file_name.lower().endswith((".jpg", ".jpeg")) else "image/png"
-                    return f"data:{mime};base64,{encoded}"
-            
-            # 2. Fallback to Full URL
-            return frappe.utils.get_url(real_src)
-        except Exception:
-            return frappe.utils.get_url(src)
-
-    front_img = _get_base64_image("/files/CrecheFrontpage.jpg")
-    front_html = f"""
+    # 2. Generate Cover & Title Pages
+    # For Frappe Cloud, we use frappe.utils.pdf.get_pdf for the most robust image handling
+    from frappe.utils.pdf import get_pdf
+    
+    # Page 1: Image Cover
+    image_url = frappe.utils.get_url("/files/CrecheFrontpage.jpg")
+    image_html = f"""
     <html>
-    <head>
-        <meta charset='UTF-8'>
-        <style>
-            html, body {{ margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background-color: white; font-family: sans-serif; }}
-            .cover-img {{ width: 100%; height: 100%; object-fit: cover; display: block; border: none; }}
-        </style>
-    </head>
-    <body><img src="{front_img}" class="cover-img"></body>
+    <head><meta charset='UTF-8'><style>
+        html, body {{ margin: 0; padding: 0; width: 100%; height: 100%; }}
+        .cover-img {{ width: 100%; height: 100%; object-fit: cover; display: block; }}
+    </style></head>
+    <body><img src="{image_url}" class="cover-img"></body>
     </html>
     """
     
-    cover_pdf_bin = pdfkit.from_string(front_html, False, options={
-        "page-size": "A4", "margin-top": "0", "margin-bottom": "0", "margin-left": "0", "margin-right": "0",
-        "enable-local-file-access": "", "enable-external-links": "", 
-        "enable-javascript": "", "no-stop-slow-scripts": "", "quiet": ""
-    })
-    
-    back_img = _get_base64_image("/files/crechebackpage.jpg")
-    back_html = f"""
+    # Page 2: Text Title
+    title_html = """
     <html>
-    <head>
-        <meta charset='UTF-8'>
-        <style>
-            html, body {{ margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background-color: white; font-family: sans-serif; }}
-            .cover-img {{ width: 100%; height: 100%; object-fit: cover; display: block; border: none; }}
-        </style>
-    </head>
-    <body style="margin: 0; padding: 0;"><img src="{back_img}" class="cover-img"></body>
+    <head><meta charset='UTF-8'><style>
+        html, body { margin: 0; padding: 0; width: 100%; height: 100%; display: flex; justify-content: center; align-items: center; background-color: white; }
+        .title-card { text-align: center; font-family: Georgia, serif; font-size: 36pt; font-weight: bold; }
+    </style></head>
+    <body style="margin: 0; padding: 0;">
+        <div style="width: 100%; height: 297mm; display: flex; justify-content: center; align-items: center;">
+            <div class="title-card">Creche Guidelines</div>
+        </div>
+    </body>
     </html>
     """
     
-    # 4. Custom PDF Options for maximum Cloud support
-    COVER_OPTS = {
-        "page-size": "A4", "margin-top": "0", "margin-bottom": "0", "margin-left": "0", "margin-right": "0",
-        "encoding": "UTF-8", "quiet": "", "no-outline": "", 
-        "enable-local-file-access": "", "enable-external-links": "", 
-        "enable-javascript": "", "no-stop-slow-scripts": "",
-        "custom-header": [("User-Agent", "Mozilla/5.0")], "custom-header-propagation": "",
-        "load-error-handling": "ignore", "load-media-error-handling": "ignore"
-    }
+    # Generate Cover/Title binaries (using Frappe's utility for Cloud compatibility)
+    cover_pdf_bin = get_pdf(image_html, options={"page-size": "A4", "margin-top": "0", "margin-bottom": "0", "margin-left": "0", "margin-right": "0", "quiet": ""})
+    title_pdf_bin = get_pdf(title_html, options={"page-size": "A4", "margin-top": "0", "margin-bottom": "0", "margin-left": "0", "margin-right": "0", "quiet": ""})
 
-    cover_pdf_bin = pdfkit.from_string(front_html, False, options=COVER_OPTS)
-    back_pdf_bin = pdfkit.from_string(back_html, False, options=COVER_OPTS)
-
-    # 4. Generate content PDF
+    # 3. Generate content PDF
     content_pdf = pdfkit.from_string(content_html, False, options=_pdf_options(None))
     if not content_pdf:
         frappe.log_error("Content PDF generation failed (empty result)")
@@ -416,35 +379,35 @@ def _post_process_pdf(main_html, groups):
     toc_pdf = pdfkit.from_string(build_toc(0), False, options=_pdf_options(None))
     toc_page_count = len(PdfReader(io.BytesIO(toc_pdf)).pages)
     
-    # Pass 2: Final TOC with correct page shifts (Cover + TOC pages)
-    shift_amount = 1 + toc_page_count
+    # Pass 2: Final TOC with correct page shifts (Cover + Title + TOC pages)
+    shift_amount = 2 + toc_page_count
     toc_pdf = pdfkit.from_string(build_toc(shift_amount), False, options=_pdf_options(None))
     toc_reader = PdfReader(io.BytesIO(toc_pdf))
     
     # 5. Merge
     writer = PdfWriter()
     
-    # Add Cover
+    # Add Cover (Image Page)
     if cover_pdf_bin:
         cover_reader = PdfReader(io.BytesIO(cover_pdf_bin))
         for page in cover_reader.pages: writer.add_page(page)
+
+    # Add Title Page (Text)
+    if title_pdf_bin:
+        title_reader = PdfReader(io.BytesIO(title_pdf_bin))
+        for page in title_reader.pages: writer.add_page(page)
 
     # Add TOC
     for page in toc_reader.pages: writer.add_page(page)
     
     # Add Content
     for page in reader.pages: writer.add_page(page)
-
-    # Add Back Cover
-    if back_pdf_bin:
-        back_reader = PdfReader(io.BytesIO(back_pdf_bin))
-        for page in back_reader.pages: writer.add_page(page)
     
     output = io.BytesIO()
     writer.write(output)
     
-    # 6. Final Pass: Add Page Numbers (skip cover and backpage)
-    return _add_page_numbers(output.getvalue(), skip_first=True, skip_last=True)
+    # 6. Final Pass: Add Page Numbers (skip cover and title page)
+    return _add_page_numbers(output.getvalue(), skip_first=True, skip_last=False, skip_count=2)
 
 FOOTER_HTML = """<!DOCTYPE html><html><head><script>
 function subst() {
