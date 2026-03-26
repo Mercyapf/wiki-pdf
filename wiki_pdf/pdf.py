@@ -305,11 +305,11 @@ def _post_process_pdf(main_html, groups):
     full_body = "\n".join(anchor_html)
     content_html = _inline_images(_wrap(full_body))
     
-    # 2. Generate Cover & Title Pages (Cloud-Compatible Final Shot)
+    # 2. Generate Cover Image (Fixed visibility for Cloud)
     from frappe.utils.pdf import get_pdf
-    
-    # Page 1: Image Cover (Using get_content() + Base64 for 100% reliability on S3/Cloud)
     cover_pdf_bin = None
+    
+    # Resolve image /files/CrecheFrontpage.jpg
     f_name = frappe.db.get_value("File", {"file_url": "/files/CrecheFrontpage.jpg"}, "name")
     if not f_name:
         f_name = frappe.db.get_value("File", {"file_name": ["like", "%CrecheFrontpage%"]}, "name")
@@ -320,31 +320,16 @@ def _post_process_pdf(main_html, groups):
         if content:
             encoded = base64.b64encode(content).decode()
             mime = "image/jpeg" if f_doc.file_name.lower().endswith((".jpg", ".jpeg")) else "image/png"
+            # Final ultra-stable A4 template for Cloud - uses width/height 100% and object-fit
             image_html = f"""
             <html><head><meta charset='UTF-8'><style>
                 html, body {{ margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background-color: white; }}
-                table {{ width: 100%; height: 100%; border-collapse: collapse; }}
-                td {{ margin: 0; padding: 0; vertical-align: middle; text-align: center; }}
-                img {{ width: auto; height: 100%; display: block; margin: 0 auto; }}
+                img {{ width: 100%; height: 100%; object-fit: fill; display: block; border: none; }}
             </style></head>
-            <body><table><tr><td><img src="data:{mime};base64,{encoded}"></td></tr></table></body>
+            <body><img src="data:{mime};base64,{encoded}"></body>
             </html>
             """
             cover_pdf_bin = get_pdf(image_html, options={"page-size": "A4", "margin-top": "0", "margin-bottom": "0", "margin-left": "0", "margin-right": "0", "quiet": ""})
-
-    # Page 2: Text Title (Using Table-based centering for older Cloud engines)
-    title_html = """
-    <html><head><meta charset='UTF-8'><style>
-        html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background-color: white; }
-        table { width: 100%; height: 100%; border-collapse: collapse; border: none; }
-        td { vertical-align: middle; text-align: center; font-family: Georgia, serif; font-size: 36pt; font-weight: bold; }
-    </style></head>
-    <body style="margin: 0; padding: 0;">
-        <table><tr><td>Creche Guidelines</td></tr></table>
-    </body>
-    </html>
-    """
-    title_pdf_bin = get_pdf(title_html, options={"page-size": "A4", "margin-top": "0", "margin-bottom": "0", "margin-left": "0", "margin-right": "0", "quiet": ""})
 
     # 3. Generate content PDF
     content_pdf = pdfkit.from_string(content_html, False, options=_pdf_options(None))
@@ -385,23 +370,18 @@ def _post_process_pdf(main_html, groups):
     toc_pdf = pdfkit.from_string(build_toc(0), False, options=_pdf_options(None))
     toc_page_count = len(PdfReader(io.BytesIO(toc_pdf)).pages)
     
-    # Pass 2: Final TOC with correct page shifts (Cover + Title + TOC pages)
-    shift_amount = 2 + toc_page_count
+    # Pass 2: Final TOC with correct page shifts (One Cover + TOC pages)
+    shift_amount = (1 if cover_pdf_bin else 0) + toc_page_count
     toc_pdf = pdfkit.from_string(build_toc(shift_amount), False, options=_pdf_options(None))
     toc_reader = PdfReader(io.BytesIO(toc_pdf))
     
     # 5. Merge
     writer = PdfWriter()
     
-    # Add Cover (Image Page)
+    # Add Cover (Single page image)
     if cover_pdf_bin:
         cover_reader = PdfReader(io.BytesIO(cover_pdf_bin))
         for page in cover_reader.pages: writer.add_page(page)
-
-    # Add Title Page (Text)
-    if title_pdf_bin:
-        title_reader = PdfReader(io.BytesIO(title_pdf_bin))
-        for page in title_reader.pages: writer.add_page(page)
 
     # Add TOC
     for page in toc_reader.pages: writer.add_page(page)
@@ -412,8 +392,8 @@ def _post_process_pdf(main_html, groups):
     output = io.BytesIO()
     writer.write(output)
     
-    # 6. Final Pass: Add Page Numbers (skip cover and title page)
-    return _add_page_numbers(output.getvalue(), skip_first=True, skip_last=False, skip_count=2)
+    # 6. Final Pass: Add Page Numbers (skip only the cover)
+    return _add_page_numbers(output.getvalue(), skip_first=True, skip_last=False, skip_count=1)
 
 FOOTER_HTML = """<!DOCTYPE html><html><head><script>
 function subst() {
@@ -474,6 +454,10 @@ def download_wiki_pdf(page_name=None, route=None):
             for s in sidebar:
                 if s.wiki_page in p_map:
                     p = p_map[s.wiki_page]
+                    # SKIP REDUNDANT COVER PAGE (Title match)
+                    if p.title in ["Creche Guideline", "Creche Guidelines"]:
+                        continue
+
                     label = s.parent_label or ""
                     
                     if not groups or groups[-1]["label"] != label:
