@@ -305,31 +305,18 @@ def _post_process_pdf(main_html, groups):
     full_body = "\n".join(anchor_html)
     content_html = _inline_images(_wrap(full_body))
     
-    # 2. Generate Cover Image (Fixed visibility for Cloud)
+    # 2. Generate Cover Page (Centered Title)
     from frappe.utils.pdf import get_pdf
-    cover_pdf_bin = None
-    
-    # Resolve image /files/CrecheFrontpage.jpg
-    f_name = frappe.db.get_value("File", {"file_url": "/files/CrecheFrontpage.jpg"}, "name")
-    if not f_name:
-        f_name = frappe.db.get_value("File", {"file_name": ["like", "%CrecheFrontpage%"]}, "name")
-    
-    if f_name:
-        f_doc = frappe.get_doc("File", f_name)
-        content = f_doc.get_content()
-        if content:
-            encoded = base64.b64encode(content).decode()
-            mime = "image/jpeg" if f_doc.file_name.lower().endswith((".jpg", ".jpeg")) else "image/png"
-            # Final ultra-stable A4 template for Cloud - uses width/height 100% and object-fit
-            image_html = f"""
-            <html><head><meta charset='UTF-8'><style>
-                html, body {{ margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background-color: white; }}
-                img {{ width: 100%; height: 100%; object-fit: fill; display: block; border: none; }}
-            </style></head>
-            <body><img src="data:{mime};base64,{encoded}"></body>
-            </html>
-            """
-            cover_pdf_bin = get_pdf(image_html, options={"page-size": "A4", "margin-top": "0", "margin-bottom": "0", "margin-left": "0", "margin-right": "0", "quiet": ""})
+    cover_html = """
+    <html><head><meta charset='UTF-8'><style>
+        html, body { margin: 0; padding: 0; width: 100%; height: 100%; display: table; background-color: white; }
+        .container { display: table-cell; vertical-align: middle; text-align: center; height: 100%; width: 100%; }
+        h1 { font-family: Georgia, serif; font-size: 48pt; font-weight: bold; color: #111; margin: 0; }
+    </style></head>
+    <body><div class="container"><h1>Creche Guidelines</h1></div></body>
+    </html>
+    """
+    cover_pdf_bin = get_pdf(cover_html, options={"page-size": "A4", "margin-top": "0", "margin-bottom": "0", "margin-left": "0", "margin-right": "0", "quiet": ""})
 
     # 3. Generate content PDF
     content_pdf = pdfkit.from_string(content_html, False, options=_pdf_options(None))
@@ -378,7 +365,7 @@ def _post_process_pdf(main_html, groups):
     # 5. Merge
     writer = PdfWriter()
     
-    # Add Cover (Single page image)
+    # Add Cover (Centered Title)
     if cover_pdf_bin:
         cover_reader = PdfReader(io.BytesIO(cover_pdf_bin))
         for page in cover_reader.pages: writer.add_page(page)
