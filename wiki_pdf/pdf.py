@@ -325,7 +325,7 @@ def _post_process_pdf(main_html, groups):
                 html, body {{ margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background-color: white; }}
                 table {{ width: 100%; height: 100%; border-collapse: collapse; }}
                 td {{ margin: 0; padding: 0; vertical-align: middle; text-align: center; }}
-                img {{ width: 100%; height: auto; display: block; margin: 0 auto; }}
+                img {{ width: 100%; height: auto; display: block; margin: 0; }}
             </style></head>
             <body><table><tr><td><img src="data:{mime};base64,{encoded}"></td></tr></table></body>
             </html>
@@ -343,6 +343,30 @@ def _post_process_pdf(main_html, groups):
     # </html>
     # """
     # title_pdf_bin = get_pdf(title_html, options={"page-size": "A4", "margin-top": "0", "margin-bottom": "0", "margin-left": "0", "margin-right": "0", "quiet": ""})
+
+    # 2c. Back Cover
+    back_cover_pdf_bin = None
+    b_name = frappe.db.get_value("File", {"file_url": "/files/crechebackpage.jpg"}, "name")
+    if not b_name:
+        b_name = frappe.db.get_value("File", {"file_name": ["like", "%crechebackpage%"]}, "name")
+    
+    if b_name:
+        b_doc = frappe.get_doc("File", b_name)
+        b_content = b_doc.get_content()
+        if b_content:
+            b_encoded = base64.b64encode(b_content).decode()
+            b_mime = "image/jpeg" if b_doc.file_name.lower().endswith((".jpg", ".jpeg")) else "image/png"
+            b_image_html = f"""
+            <html><head><meta charset='UTF-8'><style>
+                html, body {{ margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background-color: white; }}
+                table {{ width: 100%; height: 100%; border-collapse: collapse; }}
+                td {{ margin: 0; padding: 0; vertical-align: middle; text-align: center; }}
+                img {{ width: 100%; height: auto; display: block; margin: 0; }}
+            </style></head>
+            <body><table><tr><td><img src="data:{b_mime};base64,{b_encoded}"></td></tr></table></body>
+            </html>
+            """
+            back_cover_pdf_bin = get_pdf(b_image_html, options={"page-size": "A4", "margin-top": "0", "margin-bottom": "0", "margin-left": "0", "margin-right": "0", "quiet": ""})
 
     # 3. Generate content PDF
     content_pdf = pdfkit.from_string(content_html, False, options=_pdf_options(None))
@@ -408,12 +432,17 @@ def _post_process_pdf(main_html, groups):
     
     # Add Content
     for page in reader.pages: writer.add_page(page)
+
+    # Add Back Cover
+    if back_cover_pdf_bin:
+        back_reader = PdfReader(io.BytesIO(back_cover_pdf_bin))
+        for page in back_reader.pages: writer.add_page(page)
     
     output = io.BytesIO()
     writer.write(output)
     
-    # 6. Final Pass: Add Page Numbers (skip cover and title pages)
-    return _add_page_numbers(output.getvalue(), skip_first=True, skip_last=False, skip_count=skip_c)
+    # 6. Final Pass: Add Page Numbers (skip cover and back cover)
+    return _add_page_numbers(output.getvalue(), skip_first=True, skip_last=True, skip_count=skip_c)
 
 FOOTER_HTML = """<!DOCTYPE html><html><head><script>
 function subst() {
