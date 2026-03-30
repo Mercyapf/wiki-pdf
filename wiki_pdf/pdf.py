@@ -260,7 +260,7 @@ def _add_page_numbers(pdf_bin, skip_first=False, skip_last=False, skip_count=1):
         for i in range(total_pages):
             content_page = reader.pages[i]
             # CRITICAL: Don't merge if it's a skipped page (prevents white bar on covers)
-            is_skipped = (skip_first and i == 0) or (skip_last and i == total_pages - 1)
+            is_skipped = (skip_first and i < skip_count) or (skip_last and i == total_pages - 1)
             if not is_skipped and i < len(footer_reader.pages):
                 content_page.merge_page(footer_reader.pages[i])
             writer.add_page(content_page)
@@ -305,18 +305,44 @@ def _post_process_pdf(main_html, groups):
     full_body = "\n".join(anchor_html)
     content_html = _inline_images(_wrap(full_body))
     
-    # 2. Generate Cover Page (Centered Title)
+    # 2. Generate Cover & Title Pages
     from frappe.utils.pdf import get_pdf
-    cover_html = """
-    <html><head><meta charset='UTF-8'><style>
-        html, body { margin: 0; padding: 0; width: 100%; height: 100%; display: table; background-color: white; }
-        .container { display: table-cell; vertical-align: middle; text-align: center; height: 100%; width: 100%; }
-        h1 { font-family: Georgia, serif; font-size: 48pt; font-weight: bold; color: #111; margin: 0; }
-    </style></head>
-    <body><div class="container"><h1>Creche Guidelines</h1></div></body>
-    </html>
-    """
-    cover_pdf_bin = get_pdf(cover_html, options={"page-size": "A4", "margin-top": "0", "margin-bottom": "0", "margin-left": "0", "margin-right": "0", "quiet": ""})
+    
+    # 2a. Page 1: Image Cover
+    cover_pdf_bin = None
+    f_name = frappe.db.get_value("File", {"file_url": "/files/CrecheFrontpage.jpg"}, "name")
+    if not f_name:
+        f_name = frappe.db.get_value("File", {"file_name": ["like", "%CrecheFrontpage%"]}, "name")
+    
+    if f_name:
+        f_doc = frappe.get_doc("File", f_name)
+        content = f_doc.get_content()
+        if content:
+            encoded = base64.b64encode(content).decode()
+            mime = "image/jpeg" if f_doc.file_name.lower().endswith((".jpg", ".jpeg")) else "image/png"
+            image_html = f"""
+            <html><head><meta charset='UTF-8'><style>
+                html, body {{ margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background-color: white; }}
+                table {{ width: 100%; height: 100%; border-collapse: collapse; }}
+                td {{ margin: 0; padding: 0; vertical-align: middle; text-align: center; }}
+                img {{ width: 100%; height: auto; display: block; margin: 0 auto; }}
+            </style></head>
+            <body><table><tr><td><img src="data:{mime};base64,{encoded}"></td></tr></table></body>
+            </html>
+            """
+            cover_pdf_bin = get_pdf(image_html, options={"page-size": "A4", "margin-top": "0", "margin-bottom": "0", "margin-left": "0", "margin-right": "0", "quiet": ""})
+
+    # # 2b. Page 2: Text Title
+    # title_html = """
+    # <html><head><meta charset='UTF-8'><style>
+    #     html, body { margin: 0; padding: 0; width: 100%; height: 100%; display: table; background-color: white; }
+    #     .container { display: table-cell; vertical-align: middle; text-align: center; height: 100%; width: 100%; }
+    #     h1 { font-family: Georgia, serif; font-size: 48pt; font-weight: bold; color: #111; margin: 0; }
+    # </style></head>
+    # <body><div class="container"><h1>Creche Guidelines</h1></div></body>
+    # </html>
+    # """
+    # title_pdf_bin = get_pdf(title_html, options={"page-size": "A4", "margin-top": "0", "margin-bottom": "0", "margin-left": "0", "margin-right": "0", "quiet": ""})
 
     # 3. Generate content PDF
     content_pdf = pdfkit.from_string(content_html, False, options=_pdf_options(None))
@@ -357,18 +383,25 @@ def _post_process_pdf(main_html, groups):
     toc_pdf = pdfkit.from_string(build_toc(0), False, options=_pdf_options(None))
     toc_page_count = len(PdfReader(io.BytesIO(toc_pdf)).pages)
     
-    # Pass 2: Final TOC with correct page shifts (One Cover + TOC pages)
-    shift_amount = (1 if cover_pdf_bin else 0) + toc_page_count
+    # Pass 2: Final TOC with correct page shifts (Cover + Title + TOC pages)
+    skip_c = (1 if cover_pdf_bin else 0) 
+    # + (1 if title_pdf_bin else 0)
+    shift_amount = skip_c + toc_page_count
     toc_pdf = pdfkit.from_string(build_toc(shift_amount), False, options=_pdf_options(None))
     toc_reader = PdfReader(io.BytesIO(toc_pdf))
     
     # 5. Merge
     writer = PdfWriter()
     
-    # Add Cover (Centered Title)
+    # Add Cover (Image Page)
     if cover_pdf_bin:
         cover_reader = PdfReader(io.BytesIO(cover_pdf_bin))
         for page in cover_reader.pages: writer.add_page(page)
+
+    # # Add Title Page (Text)
+    # if title_pdf_bin:
+    #     title_reader = PdfReader(io.BytesIO(title_pdf_bin))
+    #     for page in title_reader.pages: writer.add_page(page)
 
     # Add TOC
     for page in toc_reader.pages: writer.add_page(page)
@@ -379,8 +412,8 @@ def _post_process_pdf(main_html, groups):
     output = io.BytesIO()
     writer.write(output)
     
-    # 6. Final Pass: Add Page Numbers (skip only the cover)
-    return _add_page_numbers(output.getvalue(), skip_first=True, skip_last=False, skip_count=1)
+    # 6. Final Pass: Add Page Numbers (skip cover and title pages)
+    return _add_page_numbers(output.getvalue(), skip_first=True, skip_last=False, skip_count=skip_c)
 
 FOOTER_HTML = """<!DOCTYPE html><html><head><script>
 function subst() {
@@ -441,10 +474,6 @@ def download_wiki_pdf(page_name=None, route=None):
             for s in sidebar:
                 if s.wiki_page in p_map:
                     p = p_map[s.wiki_page]
-                    # SKIP REDUNDANT COVER PAGE (Title match)
-                    if p.title in ["Creche Guideline", "Creche Guidelines"]:
-                        continue
-
                     label = s.parent_label or ""
                     
                     if not groups or groups[-1]["label"] != label:
