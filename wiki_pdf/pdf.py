@@ -13,6 +13,33 @@ from frappe.core.doctype.file.utils import find_file_by_url
 from urllib.parse import urlparse, unquote
 from frappe import _
 
+
+
+# ✅ ADD THIS BLOCK HERE ↓↓↓
+from googletrans import Translator
+
+translator = Translator()
+
+def translate_text(text, lang="en"):
+    if not text or lang == "en":
+        return text
+
+    try:
+        # Split long text (important for large wiki pages)
+        chunks = [text[i:i+4000] for i in range(0, len(text), 4000)]
+        translated_chunks = []
+
+        for chunk in chunks:
+            translated = translator.translate(chunk, dest=lang)
+            translated_chunks.append(translated.text)
+
+        return "".join(translated_chunks)
+
+    except Exception as e:
+        frappe.log_error(f"Translation failed: {str(e)}", "Translation Error")
+        return text
+# ✅ END HERE ↑↑↑
+
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIG & HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -481,53 +508,203 @@ def _wrap(body):
 # MAIN ENDPOINTS
 # ─────────────────────────────────────────────────────────────────────────────
 
+# @frappe.whitelist(allow_guest=True)
+
+# # def download_wiki_pdf(page_name=None, route=None):
+
+# def download_wiki_pdf(page_name=None, route=None, lang="en"):
+#     """Download single Wiki page or current page and its siblings in space."""
+#     try:
+#         target_name = page_name or _find_page(route)
+#         if not target_name: frappe.throw(f"Wiki Page not found: {route or page_name}")
+
+#         page_doc = frappe.get_doc("Wiki Page", target_name, ignore_permissions=True)
+#         wiki_group_item = frappe.db.get_value("Wiki Group Item", {"wiki_page": target_name}, ["parent"], as_dict=True)
+
+#         groups = []
+#         if not wiki_group_item:
+            
+#                 raw_content = page_doc.content or ""
+#                 translated_content = translate_text(raw_content, lang)
+
+#                 translated_title = translate_text(page_doc.title, lang)
+
+#                 groups.append({ "label": None, "pages": [{ "title": translated_title, "content_html": _clean_for_pdf(_md_to_html(translated_content)) }]
+# })
+            
+#             # groups.append({"label": None, "pages": [{"title": page_doc.title, "content_html": _clean_for_pdf(_md_to_html(page_doc.content or ""))}]})
+#         else:
+#             sidebar = frappe.get_all("Wiki Group Item", filters={"parent": wiki_group_item.parent}, fields=["wiki_page", "parent_label"], order_by="idx asc", ignore_permissions=True, limit=0)
+#             p_names = [s.wiki_page for s in sidebar if s.wiki_page]
+#             p_map = {p.name: p for p in frappe.get_all("Wiki Page", filters={"name": ["in", p_names]}, fields=["name", "title", "content"], ignore_permissions=True, limit=0)}
+
+#     group_counter = 1
+#     for s in sidebar:
+#                 if s.wiki_page in p_map:
+#                     p = p_map[s.wiki_page]
+#                     label = s.parent_label or ""
+                    
+#     if not groups or groups[-1]["label"] != label:
+#             groups.append({"label": label, "number": group_counter, "anchor": f"GTOC-{group_counter}", "pages": []})
+#             group_counter += 1
+#             ref_counter = 1
+                    
+#             full_number = f"{groups[-1]['number']}.{ref_counter}"
+#                     # groups[-1]["pages"].append({
+#                     #     "number": full_number,
+#                     #     "title": p.title,
+#                     #     "anchor": f"PTOC-{full_number.replace('.', '-')}",
+#                     #     "content_html": _clean_for_pdf(_md_to_html(p.content or ""))
+#                     # })
+#             raw_content = p.content or ""
+#             translated_content = translate_text(raw_content, lang)
+
+#             translated_title = translate_text(p.title, lang)
+
+#             groups[-1]["pages"].append({
+#                             "number": full_number,
+#                             "title": translated_title,
+#                             "anchor": f"PTOC-{full_number.replace('.', '-')}",
+#                             "content_html": _clean_for_pdf(_md_to_html(translated_content))
+#                        })
+#             ref_counter += 1
+
+#             if not groups or not any(g["pages"] for g in groups):
+#                     frappe.throw(_("No content found to generate PDF"))
+
+#             pdf_bin = _post_process_pdf(None, groups)
+
+#         # Build filename
+#     filename = "Creche Guideline"
+
+#     frappe.local.response.filename = f"{filename or 'Wiki'}.pdf".replace(" ", "_")
+#     frappe.local.response.filecontent = pdf_bin
+    
+#     frappe.local.response.type = "download"
+
+# except Exception as e:
+# frappe.log_error(frappe.get_traceback(), "Wiki PDF Error")
+# frappe.throw(f"Error: {str(e)}")
+
 @frappe.whitelist(allow_guest=True)
-def download_wiki_pdf(page_name=None, route=None):
-    """Download single Wiki page or current page and its siblings in space."""
+def download_wiki_pdf(page_name=None, route=None, lang="en"):
     try:
         target_name = page_name or _find_page(route)
-        if not target_name: frappe.throw(f"Wiki Page not found: {route or page_name}")
+        if not target_name:
+            frappe.throw(f"Wiki Page not found: {route or page_name}")
 
         page_doc = frappe.get_doc("Wiki Page", target_name, ignore_permissions=True)
-        wiki_group_item = frappe.db.get_value("Wiki Group Item", {"wiki_page": target_name}, ["parent"], as_dict=True)
+        wiki_group_item = frappe.db.get_value(
+            "Wiki Group Item",
+            {"wiki_page": target_name},
+            ["parent"],
+            as_dict=True
+        )
 
         groups = []
+
+        # ✅ CASE 1: Single page
         if not wiki_group_item:
-            groups.append({"label": None, "pages": [{"title": page_doc.title, "content_html": _clean_for_pdf(_md_to_html(page_doc.content or ""))}]})
+            raw_content = page_doc.content or ""
+            if lang and lang != "en":
+                translated_content = translate_text(raw_content, lang)
+                translated_title = translate_text(page_doc.title, lang)
+            else:
+                translated_content = raw_content
+                translated_title = page_doc.title
+            # translated_content = translate_text(raw_content, lang)
+            # translated_title = translate_text(page_doc.title, lang)
+
+            groups.append({
+                "label": None,
+                "pages": [{
+                    "title": translated_title,
+                    "content_html": _clean_for_pdf(_md_to_html(translated_content))
+                }]
+            })
+
+        # ✅ CASE 2: Group pages
         else:
-            sidebar = frappe.get_all("Wiki Group Item", filters={"parent": wiki_group_item.parent}, fields=["wiki_page", "parent_label"], order_by="idx asc", ignore_permissions=True, limit=0)
+            sidebar = frappe.get_all(
+                "Wiki Group Item",
+                filters={"parent": wiki_group_item.parent},
+                fields=["wiki_page", "parent_label"],
+                order_by="idx asc",
+                ignore_permissions=True,
+                limit=0
+            )
+
             p_names = [s.wiki_page for s in sidebar if s.wiki_page]
-            p_map = {p.name: p for p in frappe.get_all("Wiki Page", filters={"name": ["in", p_names]}, fields=["name", "title", "content"], ignore_permissions=True, limit=0)}
+
+            p_map = {
+                p.name: p for p in frappe.get_all(
+                    "Wiki Page",
+                    filters={"name": ["in", p_names]},
+                    fields=["name", "title", "content"],
+                    ignore_permissions=True,
+                    limit=0
+                )
+            }
 
             group_counter = 1
+
             for s in sidebar:
                 if s.wiki_page in p_map:
                     p = p_map[s.wiki_page]
                     label = s.parent_label or ""
-                    
+
+                    # if not groups or groups[-1]["label"] != label:
+                    #     groups.append({
+                    #         "label": label,
+                    #         "number": group_counter,
+                    #         "anchor": f"GTOC-{group_counter}",
+                    #         "pages": []
+                    #     })
+                    #     group_counter += 1
+                    #     ref_counter = 1
+
                     if not groups or groups[-1]["label"] != label:
-                        groups.append({"label": label, "number": group_counter, "anchor": f"GTOC-{group_counter}", "pages": []})
-                        group_counter += 1
-                        ref_counter = 1
-                    
+                     groups.append({
+                      "label": label,
+                      "number": group_counter,
+                      "anchor": f"GTOC-{group_counter}",
+                      "pages": []
+                     })
+                     group_counter += 1
+                     ref_counter = 1
+
                     full_number = f"{groups[-1]['number']}.{ref_counter}"
+
+                    # ✅ TRANSLATION
+                    raw_content = p.content or ""
+
+                    
+                    # translated_content = translate_text(raw_content, lang)
+                    # translated_title = translate_text(p.title, lang)
+                    if lang and lang != "en":
+                        translated_content = translate_text(raw_content, lang)
+                        translated_title = translate_text(p.title, lang)
+                    else:
+                        translated_content = raw_content
+                        translated_title = p.title
+
                     groups[-1]["pages"].append({
                         "number": full_number,
-                        "title": p.title,
+                        "title": translated_title,
                         "anchor": f"PTOC-{full_number.replace('.', '-')}",
-                        "content_html": _clean_for_pdf(_md_to_html(p.content or ""))
+                        "content_html": _clean_for_pdf(_md_to_html(translated_content))
                     })
+
                     ref_counter += 1
 
+        # ✅ FINAL CHECK (outside loop)
         if not groups or not any(g["pages"] for g in groups):
             frappe.throw(_("No content found to generate PDF"))
 
         pdf_bin = _post_process_pdf(None, groups)
 
-        # Build filename
         filename = "Creche Guideline"
-
-        frappe.local.response.filename = f"{filename or 'Wiki'}.pdf".replace(" ", "_")
+        frappe.local.response.filename = f"{filename}.pdf".replace(" ", "_")
         frappe.local.response.filecontent = pdf_bin
         frappe.local.response.type = "download"
 
@@ -535,22 +712,101 @@ def download_wiki_pdf(page_name=None, route=None):
         frappe.log_error(frappe.get_traceback(), "Wiki PDF Error")
         frappe.throw(f"Error: {str(e)}")
 
+# @frappe.whitelist(allow_guest=True)
+# # def download_full_wiki_space(wiki_space):
+# def download_full_wiki_space(wiki_space, lang="en"):
+#     """Download entire space by wiki_space route name."""
+#     try:
+#         root_name = frappe.get_doc("Wiki Page", {"route": wiki_space}, ignore_permissions=True).name
+
+#         # Pages
+#         all_pages = frappe.get_all("Wiki Page", filters={"published": 1}, fields=["name", "title", "content", "parent_wiki_page"], order_by="creation asc", ignore_permissions=True, limit=0)
+#         pages = [p for p in all_pages if p.name == root_name or p.parent_wiki_page == root_name]
+
+#         if not pages:
+#             frappe.throw(_("No content found to generate PDF"))
+
+#         # pdf_bin = _post_process_pdf(None, [{"label": None, "pages": pages}])
+
+#         processed_pages = []
+
+#         for p in pages:
+#           raw_content = p.content or ""
+
+#           if lang and lang != "en":
+#             translated_content = translate_text(raw_content, lang)
+#             translated_title = translate_text(p.title, lang)
+#           else:
+#             translated_content = raw_content
+#             translated_title = p.title
+
+#             processed_pages.append({
+#               "title": translated_title,
+#               "content_html": _clean_for_pdf(_md_to_html(translated_content))
+#              })
+
+#             pdf_bin = _post_process_pdf(None, [{"label": None, "pages": processed_pages}])
+
+#             frappe.local.response.filename = f"Creche Guideline.pdf".replace(" ", "_")
+#             frappe.local.response.filecontent = pdf_bin
+#             frappe.local.response.type = "download"
+
+#         except Exception as e:
+#             frappe.log_error(frappe.get_traceback(), "Wiki Full Space PDF Error")
+#             frappe.throw(f"Error: {str(e)}")
+
 @frappe.whitelist(allow_guest=True)
-def download_full_wiki_space(wiki_space):
+def download_full_wiki_space(wiki_space, lang="en"):
     """Download entire space by wiki_space route name."""
     try:
-        root_name = frappe.get_doc("Wiki Page", {"route": wiki_space}, ignore_permissions=True).name
+        root_name = frappe.get_doc(
+            "Wiki Page",
+            {"route": wiki_space},
+            ignore_permissions=True
+        ).name
 
-        # Pages
-        all_pages = frappe.get_all("Wiki Page", filters={"published": 1}, fields=["name", "title", "content", "parent_wiki_page"], order_by="creation asc", ignore_permissions=True, limit=0)
-        pages = [p for p in all_pages if p.name == root_name or p.parent_wiki_page == root_name]
+        all_pages = frappe.get_all(
+            "Wiki Page",
+            filters={"published": 1},
+            fields=["name", "title", "content", "parent_wiki_page"],
+            order_by="creation asc",
+            ignore_permissions=True,
+            limit=0
+        )
+
+        pages = [
+            p for p in all_pages
+            if p.name == root_name or p.parent_wiki_page == root_name
+        ]
 
         if not pages:
             frappe.throw(_("No content found to generate PDF"))
 
-        pdf_bin = _post_process_pdf(None, [{"label": None, "pages": pages}])
+        processed_pages = []
 
-        frappe.local.response.filename = f"Creche Guideline.pdf".replace(" ", "_")
+        for p in pages:
+            raw_content = p.content or ""
+
+            if lang and lang != "en":
+                translated_content = translate_text(raw_content, lang)
+                translated_title = translate_text(p.title, lang)
+            else:
+                translated_content = raw_content
+                translated_title = p.title
+
+            # ✅ ALWAYS append (fixed indentation)
+            processed_pages.append({
+                "title": translated_title,
+                "content_html": _clean_for_pdf(_md_to_html(translated_content))
+            })
+
+        # ✅ Generate PDF OUTSIDE loop
+        pdf_bin = _post_process_pdf(None, [{
+            "label": None,
+            "pages": processed_pages
+        }])
+
+        frappe.local.response.filename = "Creche_Guideline.pdf"
         frappe.local.response.filecontent = pdf_bin
         frappe.local.response.type = "download"
 
