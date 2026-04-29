@@ -7,6 +7,9 @@ description = "Custom App for Wiki PDF Download"
 requires-python = ">=3.10"
 readme = "README.md"
 dynamic = ["version"]
+dependencies = [
+    "googletrans==4.0.0-rc1"
+]
 
 [build-system]
 requires = ["flit_core >=3.4,<4"]
