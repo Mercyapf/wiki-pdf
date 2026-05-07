@@ -94,7 +94,10 @@ def generate_pdf_for_single_language(lang):
             frappe.logger().warning(f"Wiki PDF: No content for lang={lang_code}. Skipping.")
             return
 
-        pdf_bin = _post_process_pdf(None, groups, lang_code=lang_code)
+        # Reconnect DB — translation can take 10-20 min causing MySQL to drop the idle connection
+        frappe.db.connect()
+
+        pdf_bin = _post_process_pdf(None, groups)
         if not pdf_bin:
             frappe.logger().warning(f"Wiki PDF: Empty PDF for lang={lang_code}")
             return
@@ -103,11 +106,8 @@ def generate_pdf_for_single_language(lang):
         frappe.logger().info(f"Wiki PDF: Saved {cache_fname} successfully.")
 
     except Exception:
+        # Use frappe.logger() instead of frappe.log_error so we don't depend on a live DB connection
         frappe.logger().error(f"Wiki PDF generation failed for lang={lang_code}: {frappe.get_traceback()}")
-        try:
-            frappe.log_error(frappe.get_traceback(), f"Wiki PDF generation failed for lang={lang_code}")
-        except Exception:
-            pass
 
 
 def generate_daily_translated_pdfs():
@@ -133,26 +133,17 @@ def generate_daily_translated_pdfs():
 def ensure_pdf_caches_exist():
     """
     Called on login (on_login hook).
-    - Clears stuck/orphaned wiki_pdf jobs from Redis (fixes RQ Job list SIGALRM crash).
-    - For PDFs already on disk: ensures their File doctype record exists.
-    - For missing PDFs: enqueues generation.
+    Checks disk for missing language PDFs and enqueues generation for each missing one.
     """
     import os
     try:
-        from wiki_pdf.pdf import get_normalized_lang, _ensure_pdf_file_record, _clear_stuck_pdf_jobs
-        _clear_stuck_pdf_jobs()
+        from wiki_pdf.pdf import get_normalized_lang
         missing = []
         for lang in TARGET_LANGUAGES:
             lang_code = get_normalized_lang(lang)
             cache_fname = f"WikiPDF_DailyCache_{lang_code}.pdf"
             file_path = os.path.join(frappe.get_site_path("public", "files"), cache_fname)
-            if os.path.exists(file_path):
-                # File is on disk — make sure it has a File doctype record.
-                try:
-                    _ensure_pdf_file_record(cache_fname, os.path.getsize(file_path))
-                except Exception as e:
-                    frappe.logger().warning(f"Wiki PDF: Could not fix File record for {cache_fname}: {e}")
-            else:
+            if not os.path.exists(file_path):
                 missing.append(lang)
 
         if missing:
@@ -174,7 +165,7 @@ def ensure_pdf_caches_exist():
                         enqueue_after_commit=True,
                     )
         else:
-            frappe.logger().info("Wiki PDF: All language PDFs cached and File records verified.")
+            frappe.logger().info("Wiki PDF: All language PDFs already cached.")
     except Exception as e:
         frappe.logger().warning(f"Wiki PDF startup check failed: {e}")
 

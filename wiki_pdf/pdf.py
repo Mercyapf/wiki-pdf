@@ -22,9 +22,6 @@ from googletrans import Translator, LANGUAGES
 
 # Increase timeout to 60 seconds to prevent read timeouts on large texts
 translator = Translator(timeout=httpx.Timeout(60.0))
-# Patch googletrans 4.0.0rc1 bug: attribute set as raise_exception (lowercase)
-# but referenced internally as raise_Exception (uppercase) on non-200 responses.
-translator.raise_Exception = False
 
 def get_normalized_lang(lang):
     if not lang or lang == "en":
@@ -70,11 +67,7 @@ def _recreate_translator():
     try:
         import httpx as _httpx
         from googletrans import Translator as _Tr
-        t = _Tr(timeout=_httpx.Timeout(60.0))
-        # Same patch: googletrans 4.0.0rc1 sets raise_exception (lowercase) but
-        # reads raise_Exception (uppercase) on non-200 responses → AttributeError.
-        t.raise_Exception = False
-        globals()['translator'] = t
+        globals()['translator'] = _Tr(timeout=_httpx.Timeout(60.0))
     except Exception:
         pass
 
@@ -365,31 +358,6 @@ pre, code { background: #f4f4f4; font-family: monospace; border-radius: 3px; }
 pre { padding: 8pt; border: 1px solid #ddd; white-space: pre-wrap; margin: 6pt 0; page-break-inside: avoid; }
 """
 
-TOC_TITLES = {
-    "en": "Table of Contents",
-    "kn": "ವಿಷಯ ಸೂಚಿ",
-    "ta": "உள்ளடக்கம்",
-    "hi": "विषय-सूची",
-    "te": "విషయ సూచిక",
-    "mr": "अनुक्रमणिका",
-    "bn": "সূচিপত্র",
-    "gu": "સામગ્રી સૂચિ",
-    "ml": "ഉള്ളടക്കം",
-    "ur": "فہرست مضامین",
-    "pa": "ਸਮੱਗਰੀ ਸੂਚੀ",
-    "or": "ବିଷୟ ସୂଚୀ",
-    "as": "বিষয়বস্তুৰ তালিকা",
-    "sa": "विषयसूची",
-    "gom": "विषय सूची",
-    "doi": "विषय-सूची",
-    "mai": "विषय-सूची",
-    "mni-Mtei": "ꯋꯥꯈꯜ ꯑꯣꯏꯕꯒꯤ ꯄꯨꯛꯊꯣꯀꯄꯥ",
-    "ne": "सामग्री तालिका",
-    "sat": "ᱥᱟᱹᱦᱩᱛ ᱛᱟᱞᱤᱠᱟ",
-    "sd": "مواد جي فهرست",
-    "tcy": "ಪರಿವಿಡಿ",
-}
-
 # डिजाइन टोकन for manual TOC
 TOC_STYLE = """
 <style>
@@ -470,7 +438,7 @@ def _add_page_numbers(pdf_bin, skip_first=False, skip_last=False, skip_count=1):
         frappe.log_error(f"Page numbering error: {str(e)}", "Wiki PDF Error")
         return pdf_bin
 
-def _post_process_pdf(main_html, groups, lang_code="en"):
+def _post_process_pdf(main_html, groups):
     """Generates PDF with manual TOC post-processing."""
     # 1. Add invisible anchors to groups and pages
     anchor_html = []
@@ -587,8 +555,7 @@ def _post_process_pdf(main_html, groups, lang_code="en"):
                 
     # 4. Generate TOC PDF
     def build_toc(shift=0):
-        toc_title = TOC_TITLES.get(lang_code, "Table of Contents")
-        toc_lines = [f'<h1>{toc_title}</h1><div class="toc-container">']
+        toc_lines = ['<h1>Table of Contents</h1><div class="toc-container">']
         for g_idx, group in enumerate(groups):
             if group["label"]:
                 p_num = page_map.get(group["anchor"], 1) + shift
@@ -658,66 +625,20 @@ function subst() {
 <div style="font-family:Georgia,serif;font-size:10pt;text-align:center;width:100%;"><span class="page"></span></div>
 </body></html>"""
 
-def _compress_pdf_gs(pdf_bin, label=""):
-    """Compress PDF with Ghostscript: subsets embedded fonts and recompresses images.
-    Reduces Indic-language PDFs from 50-80 MB down to ~10-20 MB.
-    Falls back silently to the original bytes if gs fails or makes it larger.
+def _save_pdf_to_cache(cache_fname, pdf_bin):
+    """Write PDF to disk and create/update a File record for visibility in the File list.
+    Uses raw DB insert to bypass Frappe's before_insert hook which renames files
+    when it detects an existing file with the same name on disk.
     """
-    import os, subprocess, tempfile
-    tmp_in = tmp_out = None
-    try:
-        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
-            f.write(pdf_bin)
-            tmp_in = f.name
-        tmp_out = tmp_in + "_compressed.pdf"
-        result = subprocess.run(
-            [
-                "gs", "-sDEVICE=pdfwrite",
-                "-dCompatibilityLevel=1.4",
-                "-dPDFSETTINGS=/ebook",   # 150 dpi images + font subsetting
-                "-dEmbedAllFonts=true",
-                "-dSubsetFonts=true",
-                "-dCompressFonts=true",
-                "-dNOPAUSE", "-dQUIET", "-dBATCH",
-                f"-sOutputFile={tmp_out}", tmp_in,
-            ],
-            capture_output=True,
-            timeout=300,
-        )
-        if result.returncode == 0 and os.path.exists(tmp_out):
-            with open(tmp_out, "rb") as f:
-                compressed = f.read()
-            before_kb, after_kb = len(pdf_bin) // 1024, len(compressed) // 1024
-            frappe.logger().info(
-                f"Wiki PDF{(' ' + label) if label else ''}: gs {before_kb} KB → {after_kb} KB"
-            )
-            return compressed if len(compressed) < len(pdf_bin) else pdf_bin
-        frappe.logger().warning(
-            f"Wiki PDF: gs compression failed (rc={result.returncode}): "
-            f"{result.stderr.decode(errors='replace')[:300]}"
-        )
-    except Exception:
-        frappe.logger().warning(f"Wiki PDF: gs compression skipped: {frappe.get_traceback()[:300]}")
-    finally:
-        for p in (tmp_in, tmp_out):
-            if p:
-                try:
-                    os.unlink(p)
-                except Exception:
-                    pass
-    return pdf_bin
+    import os
 
+    file_path = os.path.join(frappe.get_site_path("public", "files"), cache_fname)
+    with open(file_path, "wb") as f:
+        f.write(pdf_bin)
 
-def _ensure_pdf_file_record(cache_fname, file_size):
-    """Create or update the File doctype record for a PDF already on disk.
-    Uses raw SQL to bypass Frappe's before_insert hook that would rename the
-    record when it detects the physical file already exists on disk.
-    Caller is responsible for having a live DB connection.
-    """
     file_url = f"/files/{cache_fname}"
-    user = frappe.session.user
-    if not user or user == "Guest":
-        user = "Administrator"
+    file_size = len(pdf_bin)
+    user = frappe.session.user or "Administrator"
     now = frappe.utils.now_datetime()
 
     existing = frappe.db.get_value("File", {"file_url": file_url}, "name")
@@ -743,27 +664,6 @@ def _ensure_pdf_file_record(cache_fname, file_size):
             "file_size": file_size,
         })
     frappe.db.commit()
-
-
-def _save_pdf_to_cache(cache_fname, pdf_bin):
-    """Compress, write PDF to disk, then ensure a File record exists."""
-    import os
-
-    pdf_bin = _compress_pdf_gs(pdf_bin, label=cache_fname)
-
-    file_path = os.path.join(frappe.get_site_path("public", "files"), cache_fname)
-    with open(file_path, "wb") as f:
-        f.write(pdf_bin)
-
-    # Ping the DB to check the connection is still alive after the long
-    # translation + generation run. If dead, reconnect. Let any failure from
-    # connect() propagate to the caller (tasks.py logs it properly).
-    try:
-        frappe.db.sql("SELECT 1")
-    except Exception:
-        frappe.db.connect()
-
-    _ensure_pdf_file_record(cache_fname, len(pdf_bin))
 
 
 def _load_pdf_from_cache(cache_fname):
@@ -894,25 +794,20 @@ def download_wiki_pdf(page_name=None, route=None, lang="en"):
             frappe.local.response.type = "download"
             return
 
-        # Not cached — enqueue generation only if not already running.
-        # Use Redis cache as primary lock (DB check has a race condition when
-        # multiple requests arrive before the enqueue commits to tabRQ Job).
+        # Not cached — enqueue generation only if not already running
         job_name = f"wiki_pdf_generate_{lang_code}"
-        cache_key = f"wiki_pdf_enqueueing_{job_name}"
-        if not frappe.cache().get_value(cache_key):
-            already_queued = frappe.db.exists("RQ Job", {
-                "job_name": job_name,
-                "status": ["in", ["queued", "started"]],
-            })
-            if not already_queued:
-                frappe.enqueue(
-                    "wiki_pdf.tasks.generate_pdf_for_single_language",
-                    lang=lang_code,
-                    queue="long",
-                    timeout=7200,
-                    job_name=job_name,
-                )
-            frappe.cache().set_value(cache_key, True, expires_in_sec=300)
+        already_queued = frappe.db.exists("RQ Job", {
+            "job_name": job_name,
+            "status": ["in", ["queued", "started"]]
+        })
+        if not already_queued:
+            frappe.enqueue(
+                "wiki_pdf.tasks.generate_pdf_for_single_language",
+                lang=lang_code,
+                queue="long",
+                timeout=7200,
+                job_name=job_name,
+            )
         frappe.throw(
             "The PDF for this language is being prepared in the background. "
             "Please try again in a few minutes."
@@ -924,108 +819,6 @@ def download_wiki_pdf(page_name=None, route=None, lang="en"):
         frappe.log_error(frappe.get_traceback(), "Wiki PDF Error")
         frappe.throw(f"Error: {str(e)}")
 
-
-def _clear_stuck_pdf_jobs():
-    """Remove stuck/orphaned wiki_pdf jobs from Redis WITHOUT calling registry.cleanup().
-
-    The RQ Job list page crashes with:
-        ValueError: signal only works in main thread of the main interpreter
-    whenever StartedJobRegistry.cleanup() finds an abandoned job and tries to
-    execute its failure callback via UnixSignalDeathPenalty (uses SIGALRM —
-    only valid in the main thread, not gunicorn worker threads).
-
-    Root cause trace:
-      registry.get_job_ids() → cleanup() → execute_failure_callback()
-      → UnixSignalDeathPenalty.__enter__() → signal.signal(SIGALRM) → ValueError
-
-    Fix: use conn.zrange(registry.key, ...) directly — this NEVER calls
-    cleanup() — then zrem the offending entries.
-
-    Frappe v15 + RQ 1.15.1 key layout (confirmed from source):
-      Queue name  : generate_qname(qtype) = "{get_bench_id()}:{qtype}"
-                    e.g. "home-frappe-frappe-bench:long"
-      Started reg : key_template "rq:wip:{0}"    → "rq:wip:home-frappe-frappe-bench:long"
-      Failed  reg : key_template "rq:failed:{0}" → "rq:failed:home-frappe-frappe-bench:long"
-      Job hash    : redis_job_namespace_prefix "rq:job:" → "rq:job:<site>::<uuid>"
-    """
-    try:
-        from frappe.utils.background_jobs import get_redis_conn, get_queue
-        from rq.registry import StartedJobRegistry, FailedJobRegistry
-
-        conn = get_redis_conn()
-        cleared = 0
-
-        for qtype in ("default", "short", "long"):
-            try:
-                # get_queue() calls generate_qname() → "{bench_id}:{qtype}"
-                # so queue.name = "home-frappe-frappe-bench:long" etc.
-                q = get_queue(qtype)
-            except Exception:
-                continue
-
-            for RegistryClass in (StartedJobRegistry, FailedJobRegistry):
-                registry = RegistryClass(queue=q, connection=conn)
-                # registry.key = "rq:wip:home-frappe-frappe-bench:long" etc.
-                # conn.zrange bypasses cleanup() entirely — no SIGALRM risk
-                raw_ids = conn.zrange(registry.key, 0, -1)
-
-                for raw_id in raw_ids:
-                    job_id = raw_id.decode() if isinstance(raw_id, bytes) else raw_id
-                    job_key = f"rq:job:{job_id}"
-                    job_data = conn.hgetall(job_key)
-
-                    # Remove if orphaned (no hash) OR confirmed wiki_pdf job
-                    is_target = not job_data
-                    if not is_target:
-                        for val in job_data.values():
-                            if isinstance(val, bytes) and b"wiki_pdf" in val:
-                                is_target = True
-                                break
-
-                    if is_target:
-                        conn.zrem(registry.key, raw_id)
-                        if job_data:
-                            conn.delete(job_key)
-                        cleared += 1
-
-        if cleared:
-            frappe.logger().info(f"Wiki PDF: cleared {cleared} stuck/orphaned jobs from Redis.")
-        return cleared
-    except Exception as e:
-        frappe.logger().warning(f"Wiki PDF: could not clear stuck jobs: {e}")
-        return 0
-
-
-@frappe.whitelist()
-def fix_rq_job_list():
-    """Clear stuck wiki_pdf jobs from Redis so the RQ Job list page stops crashing.
-    Call once from browser console after deploying:
-        frappe.call('wiki_pdf.pdf.fix_rq_job_list').then(r => console.log(r.message))
-    """
-    cleared = _clear_stuck_pdf_jobs()
-    return f"Cleared {cleared} stuck wiki_pdf jobs. The RQ Job list should work now."
-
-
-@frappe.whitelist()
-def clear_wiki_pdf_cache():
-    """Delete all cached Wiki PDFs from disk and re-enqueue generation for all languages.
-    Use this to force a full regeneration (e.g. after a TOC or content fix).
-    Call from browser console: frappe.call('wiki_pdf.pdf.clear_wiki_pdf_cache')
-    """
-    import os
-    from wiki_pdf.tasks import TARGET_LANGUAGES, generate_daily_translated_pdfs
-
-    deleted = []
-    for lang in TARGET_LANGUAGES:
-        lang_code = get_normalized_lang(lang)
-        cache_fname = f"WikiPDF_DailyCache_{lang_code}.pdf"
-        file_path = os.path.join(frappe.get_site_path("public", "files"), cache_fname)
-        if os.path.exists(file_path):
-            os.unlink(file_path)
-            deleted.append(lang_code)
-
-    generate_daily_translated_pdfs()
-    return f"Deleted {len(deleted)} cached PDFs. Generation jobs enqueued for all {len(TARGET_LANGUAGES)} languages."
 
 
 # @frappe.whitelist(allow_guest=True)
