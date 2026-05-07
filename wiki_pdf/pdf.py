@@ -358,6 +358,31 @@ pre, code { background: #f4f4f4; font-family: monospace; border-radius: 3px; }
 pre { padding: 8pt; border: 1px solid #ddd; white-space: pre-wrap; margin: 6pt 0; page-break-inside: avoid; }
 """
 
+TOC_TITLES = {
+    "en": "Table of Contents",
+    "kn": "ವಿಷಯ ಸೂಚಿ",
+    "ta": "உள்ளடக்கம்",
+    "hi": "विषय-सूची",
+    "te": "విషయ సూచిక",
+    "mr": "अनुक्रमणिका",
+    "bn": "সূচিপত্র",
+    "gu": "સામગ્રી સૂચિ",
+    "ml": "ഉള്ളടക്കം",
+    "ur": "فہرست مضامین",
+    "pa": "ਸਮੱਗਰੀ ਸੂਚੀ",
+    "or": "ବିଷୟ ସୂଚୀ",
+    "as": "বিষয়বস্তুৰ তালিকা",
+    "sa": "विषयसूची",
+    "gom": "विषय सूची",
+    "doi": "विषय-सूची",
+    "mai": "विषय-सूची",
+    "mni-Mtei": "ꯋꯥꯈꯜ ꯑꯣꯏꯕꯒꯤ ꯄꯨꯛꯊꯣꯀꯄꯥ",
+    "ne": "सामग्री तालिका",
+    "sat": "ᱥᱟᱹᱦᱩᱛ ᱛᱟᱞᱤᱠᱟ",
+    "sd": "مواد جي فهرست",
+    "tcy": "ಪರಿವಿಡಿ",
+}
+
 # डिजाइन टोकन for manual TOC
 TOC_STYLE = """
 <style>
@@ -438,7 +463,7 @@ def _add_page_numbers(pdf_bin, skip_first=False, skip_last=False, skip_count=1):
         frappe.log_error(f"Page numbering error: {str(e)}", "Wiki PDF Error")
         return pdf_bin
 
-def _post_process_pdf(main_html, groups):
+def _post_process_pdf(main_html, groups, lang_code="en"):
     """Generates PDF with manual TOC post-processing."""
     # 1. Add invisible anchors to groups and pages
     anchor_html = []
@@ -555,7 +580,7 @@ def _post_process_pdf(main_html, groups):
                 
     # 4. Generate TOC PDF
     def build_toc(shift=0):
-        toc_lines = ['<h1>Table of Contents</h1><div class="toc-container">']
+        toc_lines = [f'<h1>{TOC_TITLES.get(lang_code, "Table of Contents")}</h1><div class="toc-container">']
         for g_idx, group in enumerate(groups):
             if group["label"]:
                 p_num = page_map.get(group["anchor"], 1) + shift
@@ -625,16 +650,69 @@ function subst() {
 <div style="font-family:Georgia,serif;font-size:10pt;text-align:center;width:100%;"><span class="page"></span></div>
 </body></html>"""
 
-def _save_pdf_to_cache(cache_fname, pdf_bin):
-    """Write PDF to disk and create/update a File record for visibility in the File list.
-    Uses raw DB insert to bypass Frappe's before_insert hook which renames files
-    when it detects an existing file with the same name on disk.
+def _compress_pdf_gs(pdf_bin, label=""):
+    """Compress PDF using Ghostscript (font subsetting + image recompression).
+    Falls back to original bytes if gs is unavailable or compression makes it larger.
     """
+    import subprocess, tempfile
+    tmp_in = tmp_out = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+            f.write(pdf_bin)
+            tmp_in = f.name
+        tmp_out = tmp_in + "_compressed.pdf"
+        result = subprocess.run(
+            [
+                "gs", "-sDEVICE=pdfwrite",
+                "-dCompatibilityLevel=1.4",
+                "-dPDFSETTINGS=/ebook",
+                "-dEmbedAllFonts=true",
+                "-dSubsetFonts=true",
+                "-dCompressFonts=true",
+                "-dNOPAUSE", "-dQUIET", "-dBATCH",
+                f"-sOutputFile={tmp_out}", tmp_in,
+            ],
+            capture_output=True,
+            timeout=300,
+        )
+        if result.returncode == 0 and os.path.exists(tmp_out):
+            with open(tmp_out, "rb") as f:
+                compressed = f.read()
+            before_kb, after_kb = len(pdf_bin) // 1024, len(compressed) // 1024
+            frappe.logger().info(f"Wiki PDF {label}: gs {before_kb} KB → {after_kb} KB")
+            return compressed if len(compressed) < len(pdf_bin) else pdf_bin
+        frappe.logger().warning(
+            f"Wiki PDF: gs failed (rc={result.returncode}): "
+            f"{result.stderr.decode(errors='replace')[:200]}"
+        )
+    except Exception:
+        frappe.logger().warning(f"Wiki PDF: gs compression skipped for {label}")
+    finally:
+        for p in (tmp_in, tmp_out):
+            if p:
+                try:
+                    os.unlink(p)
+                except Exception:
+                    pass
+    return pdf_bin
+
+
+def _save_pdf_to_cache(cache_fname, pdf_bin):
+    """Compress, write PDF to disk, and create/update a File record."""
     import os
+
+    pdf_bin = _compress_pdf_gs(pdf_bin, label=cache_fname)
 
     file_path = os.path.join(frappe.get_site_path("public", "files"), cache_fname)
     with open(file_path, "wb") as f:
         f.write(pdf_bin)
+
+    # Compression can take several minutes; ping DB before using it to avoid
+    # "MySQL server has gone away" if the connection dropped during that time.
+    try:
+        frappe.db.sql("SELECT 1")
+    except Exception:
+        frappe.db.connect()
 
     file_url = f"/files/{cache_fname}"
     file_size = len(pdf_bin)

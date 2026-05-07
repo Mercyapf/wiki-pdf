@@ -97,7 +97,7 @@ def generate_pdf_for_single_language(lang):
         # Reconnect DB — translation can take 10-20 min causing MySQL to drop the idle connection
         frappe.db.connect()
 
-        pdf_bin = _post_process_pdf(None, groups)
+        pdf_bin = _post_process_pdf(None, groups, lang_code=lang_code)
         if not pdf_bin:
             frappe.logger().warning(f"Wiki PDF: Empty PDF for lang={lang_code}")
             return
@@ -133,9 +133,12 @@ def generate_daily_translated_pdfs():
 def ensure_pdf_caches_exist():
     """
     Called on login (on_login hook).
+    Only runs for System Manager / Administrator.
     Checks disk for missing language PDFs and enqueues generation for each missing one.
     """
     import os
+    if "System Manager" not in frappe.get_roles(frappe.session.user):
+        return
     try:
         from wiki_pdf.pdf import get_normalized_lang
         missing = []
