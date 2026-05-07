@@ -15,5 +15,11 @@ scheduler_events = {
     ]
 }
 
+doc_events = {
+    "Wiki Page": {
+        "after_save": "wiki_pdf.tasks.on_wiki_page_save"
+    }
+}
+
 # Runs on first request after server start - auto-generates missing PDFs on cloud deploy
 on_login = "wiki_pdf.tasks.ensure_pdf_caches_exist"

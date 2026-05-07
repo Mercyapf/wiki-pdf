@@ -22,6 +22,9 @@ from googletrans import Translator, LANGUAGES
 
 # Increase timeout to 60 seconds to prevent read timeouts on large texts
 translator = Translator(timeout=httpx.Timeout(60.0))
+# Fix googletrans 4.0.0rc1 bug: stores raise_exception (lowercase) but reads
+# raise_Exception (uppercase E) on non-200 responses → AttributeError.
+translator.raise_Exception = False
 
 def get_normalized_lang(lang):
     if not lang or lang == "en":
@@ -67,7 +70,9 @@ def _recreate_translator():
     try:
         import httpx as _httpx
         from googletrans import Translator as _Tr
-        globals()['translator'] = _Tr(timeout=_httpx.Timeout(60.0))
+        t = _Tr(timeout=_httpx.Timeout(60.0))
+        t.raise_Exception = False
+        globals()['translator'] = t
     except Exception:
         pass
 

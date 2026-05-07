@@ -8,6 +8,27 @@ TARGET_LANGUAGES = [
 ]
 
 
+def _enqueue_language(lang, lang_code):
+    """Enqueue PDF generation for one language.
+    Uses a Redis key as the deduplication lock — faster and race-condition-free
+    compared to querying tabRQ Job. TTL matches the job timeout (2 hours).
+    Returns True if enqueued, False if already active.
+    """
+    redis_key = f"wiki_pdf_active_{lang_code}"
+    if frappe.cache().get_value(redis_key):
+        return False
+    frappe.enqueue(
+        "wiki_pdf.tasks.generate_pdf_for_single_language",
+        lang=lang,
+        queue="long",
+        timeout=7200,
+        job_name=f"wiki_pdf_generate_{lang_code}",
+        enqueue_after_commit=True,
+    )
+    frappe.cache().set_value(redis_key, True, expires_in_sec=7200)
+    return True
+
+
 def generate_pdf_for_single_language(lang):
     """
     Generates and caches the PDF for one language.
@@ -108,6 +129,12 @@ def generate_pdf_for_single_language(lang):
     except Exception:
         # Use frappe.logger() instead of frappe.log_error so we don't depend on a live DB connection
         frappe.logger().error(f"Wiki PDF generation failed for lang={lang_code}: {frappe.get_traceback()}")
+    finally:
+        # Always clear the Redis lock so the next trigger can re-enqueue if needed
+        try:
+            frappe.cache().delete_value(f"wiki_pdf_active_{lang_code}")
+        except Exception:
+            pass
 
 
 def generate_daily_translated_pdfs():
@@ -119,14 +146,7 @@ def generate_daily_translated_pdfs():
     for lang in TARGET_LANGUAGES:
         from wiki_pdf.pdf import get_normalized_lang
         lang_code = get_normalized_lang(lang)
-        job_name = f"wiki_pdf_generate_{lang_code}"
-        frappe.enqueue(
-            "wiki_pdf.tasks.generate_pdf_for_single_language",
-            lang=lang,
-            queue="long",
-            timeout=7200,
-            job_name=job_name,
-        )
+        _enqueue_language(lang, lang_code)
     frappe.logger().info(f"Wiki PDF: Enqueued {len(TARGET_LANGUAGES)} language jobs.")
 
 
@@ -152,25 +172,39 @@ def ensure_pdf_caches_exist():
         if missing:
             frappe.logger().info(f"Wiki PDF: Missing PDFs for {[get_normalized_lang(l) for l in missing]}. Enqueueing...")
             for lang in missing:
-                lang_code = get_normalized_lang(lang)
-                job_name = f"wiki_pdf_generate_{lang_code}"
-                already_queued = frappe.db.exists("RQ Job", {
-                    "job_name": job_name,
-                    "status": ["in", ["queued", "started"]]
-                })
-                if not already_queued:
-                    frappe.enqueue(
-                        "wiki_pdf.tasks.generate_pdf_for_single_language",
-                        lang=lang,
-                        queue="long",
-                        timeout=7200,
-                        job_name=job_name,
-                        enqueue_after_commit=True,
-                    )
+                from wiki_pdf.pdf import get_normalized_lang as gnl
+                _enqueue_language(lang, gnl(lang))
         else:
             frappe.logger().info("Wiki PDF: All language PDFs already cached.")
     except Exception as e:
         frappe.logger().warning(f"Wiki PDF startup check failed: {e}")
+
+
+def on_wiki_page_save(doc, method):
+    """
+    Fires after any Wiki Page is saved.
+    Enqueues regeneration at most once per 15 minutes (cooldown) so a
+    30-minute editing session doesn't flood the queue.
+    Old PDFs stay on disk until the new generation completes and overwrites them,
+    so users can keep downloading while regeneration runs in the background.
+    """
+    from wiki_pdf.pdf import get_normalized_lang
+
+    # 15-minute cooldown — only enqueue once per editing window
+    cooldown_key = "wiki_pdf_regen_pending"
+    if frappe.cache().get_value(cooldown_key):
+        return
+
+    frappe.cache().set_value(cooldown_key, True, expires_in_sec=900)
+
+    enqueued = 0
+    for lang in TARGET_LANGUAGES:
+        lang_code = get_normalized_lang(lang)
+        if _enqueue_language(lang, lang_code):
+            enqueued += 1
+
+    if enqueued:
+        frappe.logger().info(f"Wiki PDF: Enqueued {enqueued} language jobs after Wiki Page save.")
 
 
 def _safe_translate(text, lang, retries=3):
