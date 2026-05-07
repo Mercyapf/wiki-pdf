@@ -94,9 +94,6 @@ def generate_pdf_for_single_language(lang):
             frappe.logger().warning(f"Wiki PDF: No content for lang={lang_code}. Skipping.")
             return
 
-        # Reconnect DB — translation can take 10-20 min causing MySQL to drop the idle connection
-        frappe.db.connect()
-
         pdf_bin = _post_process_pdf(None, groups)
         if not pdf_bin:
             frappe.logger().warning(f"Wiki PDF: Empty PDF for lang={lang_code}")
@@ -106,8 +103,11 @@ def generate_pdf_for_single_language(lang):
         frappe.logger().info(f"Wiki PDF: Saved {cache_fname} successfully.")
 
     except Exception:
-        # Use frappe.logger() instead of frappe.log_error so we don't depend on a live DB connection
         frappe.logger().error(f"Wiki PDF generation failed for lang={lang_code}: {frappe.get_traceback()}")
+        try:
+            frappe.log_error(frappe.get_traceback(), f"Wiki PDF generation failed for lang={lang_code}")
+        except Exception:
+            pass
 
 
 def generate_daily_translated_pdfs():

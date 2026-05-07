@@ -638,32 +638,48 @@ def _save_pdf_to_cache(cache_fname, pdf_bin):
 
     file_url = f"/files/{cache_fname}"
     file_size = len(pdf_bin)
-    user = frappe.session.user or "Administrator"
+    user = frappe.session.user
+    if not user or user == "Guest":
+        user = "Administrator"
     now = frappe.utils.now_datetime()
 
-    existing = frappe.db.get_value("File", {"file_url": file_url}, "name")
-    if existing:
-        frappe.db.set_value("File", existing, {
-            "file_name": cache_fname,
-            "file_size": file_size,
-        })
-    else:
-        frappe.db.sql("""
-            INSERT INTO `tabFile`
-                (name, owner, creation, modified, modified_by,
-                 file_name, file_url, file_size, is_private, folder)
-            VALUES
-                (%(name)s, %(user)s, %(now)s, %(now)s, %(user)s,
-                 %(file_name)s, %(file_url)s, %(file_size)s, 0, 'Home/Attachments')
-        """, {
-            "name": frappe.generate_hash(length=10),
-            "user": user,
-            "now": now,
-            "file_name": cache_fname,
-            "file_url": file_url,
-            "file_size": file_size,
-        })
-    frappe.db.commit()
+    # Reconnect here (not before PDF generation) so the connection is fresh
+    # when we actually need the DB — cloud MySQL drops idle connections after
+    # long PDF-generation runs.
+    try:
+        frappe.db.connect()
+    except Exception:
+        pass  # already connected; ignore
+
+    try:
+        existing = frappe.db.get_value("File", {"file_url": file_url}, "name")
+        if existing:
+            frappe.db.set_value("File", existing, {
+                "file_name": cache_fname,
+                "file_size": file_size,
+            })
+        else:
+            frappe.db.sql("""
+                INSERT INTO `tabFile`
+                    (name, owner, creation, modified, modified_by,
+                     file_name, file_url, file_size, is_private, folder)
+                VALUES
+                    (%(name)s, %(user)s, %(now)s, %(now)s, %(user)s,
+                     %(file_name)s, %(file_url)s, %(file_size)s, 0, 'Home/Attachments')
+            """, {
+                "name": frappe.generate_hash(length=10),
+                "user": user,
+                "now": now,
+                "file_name": cache_fname,
+                "file_url": file_url,
+                "file_size": file_size,
+            })
+        frappe.db.commit()
+    except Exception:
+        frappe.log_error(
+            frappe.get_traceback(),
+            f"Wiki PDF: Failed to create File record for {cache_fname}"
+        )
 
 
 def _load_pdf_from_cache(cache_fname):
