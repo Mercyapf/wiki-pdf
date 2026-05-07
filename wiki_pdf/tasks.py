@@ -8,29 +8,29 @@ TARGET_LANGUAGES = [
 ]
 
 
-def generate_daily_translated_pdfs():
+def generate_pdf_for_single_language(lang):
     """
-    Frappe daily scheduled task.
-    Generates one translated PDF per language and saves it into the File doctype.
-    The download_wiki_pdf endpoint checks these cached files first.
+    Generates and caches the PDF for one language.
+    Called as a separate background job per language so:
+    - Each language runs independently (one failure doesn't kill others)
+    - The DB connection is fresh per job (avoids MySQL gone-away after long translation)
     """
     from wiki_pdf.pdf import (
-        _find_page, _md_to_html, _clean_for_pdf, _post_process_pdf,
-        translate_html, translate_text, get_normalized_lang
+        _md_to_html, _clean_for_pdf, _post_process_pdf,
+        translate_html, get_normalized_lang
     )
 
-    frappe.logger().info("Wiki PDF: Starting daily PDF generation job...")
+    lang_code = get_normalized_lang(lang)
+    cache_fname = f"WikiPDF_DailyCache_{lang_code}.pdf"
+    frappe.logger().info(f"Wiki PDF: Starting generation for lang={lang_code}")
 
-    # Determine which Wiki Space to dump
-    # Resolve this from the first available wiki group sidebar
     try:
         sidebar_parents = frappe.get_all("Wiki Group Item", fields=["parent"], limit=1)
         if not sidebar_parents:
-            frappe.log_error("No Wiki Group Items found. Skipping daily PDF generation.", "Wiki PDF Task")
+            frappe.logger().warning("Wiki PDF: No Wiki Group Items found.")
             return
-        
-        sidebar_parent = sidebar_parents[0].parent
 
+        sidebar_parent = sidebar_parents[0].parent
         sidebar = frappe.get_all(
             "Wiki Group Item",
             filters={"parent": sidebar_parent},
@@ -42,7 +42,7 @@ def generate_daily_translated_pdfs():
 
         p_names = [s.wiki_page for s in sidebar if s.wiki_page]
         if not p_names:
-            frappe.log_error("No wiki pages found in sidebar.", "Wiki PDF Task")
+            frappe.logger().warning("Wiki PDF: No wiki pages found in sidebar.")
             return
 
         p_map = {
@@ -55,93 +55,92 @@ def generate_daily_translated_pdfs():
             )
         }
 
-    except Exception as e:
-        frappe.log_error(f"Failed to fetch wiki content: {e}", "Wiki PDF Task")
-        return
+        groups = []
+        group_counter = 1
+        ref_counter = 1
 
-    for lang in TARGET_LANGUAGES:
-        lang_code = get_normalized_lang(lang)
+        for s in sidebar:
+            if s.wiki_page not in p_map:
+                continue
+            p = p_map[s.wiki_page]
+            label = s.parent_label or ""
 
-        frappe.logger().info(f"Wiki PDF: Generating PDF for language: {lang_code}")
-        cache_fname = f"WikiPDF_DailyCache_{lang_code}.pdf"
-
-        try:
-            groups = []
-            group_counter = 1
-            ref_counter = 1
-
-            for s in sidebar:
-                if s.wiki_page not in p_map:
-                    continue
-                p = p_map[s.wiki_page]
-                label = s.parent_label or ""
-
-                if not groups or groups[-1]["label"] != label:
-                    # Translate the group parent_label
-                    translated_label = _safe_translate(label, lang_code) if label else label
-                    groups.append({
-                        "label": translated_label,
-                        "number": group_counter,
-                        "anchor": f"GTOC-{group_counter}",
-                        "pages": []
-                    })
-                    group_counter += 1
-                    ref_counter = 1
-
-                raw_html = _md_to_html(p.content or "")
-                translated_html = translate_html(raw_html, lang_code)
-                translated_title = _safe_translate(p.title, lang_code)
-
-                full_number = f"{groups[-1]['number']}.{ref_counter}"
-                groups[-1]["pages"].append({
-                    "number": full_number,
-                    "title": translated_title,
-                    "anchor": f"PTOC-{full_number.replace('.', '-')}",
-                    "content_html": _clean_for_pdf(translated_html)
+            if not groups or groups[-1]["label"] != label:
+                translated_label = _safe_translate(label, lang_code) if label else label
+                groups.append({
+                    "label": translated_label,
+                    "number": group_counter,
+                    "anchor": f"GTOC-{group_counter}",
+                    "pages": []
                 })
-                ref_counter += 1
+                group_counter += 1
+                ref_counter = 1
 
-                # Small delay to avoid rate limiting
-                time.sleep(0.5)
+            raw_html = _md_to_html(p.content or "")
+            translated_html = translate_html(raw_html, lang_code)
+            translated_title = _safe_translate(p.title, lang_code)
 
-            if not groups or not any(g["pages"] for g in groups):
-                frappe.log_error(f"No content found for language {lang_code}. Skipping.", "Wiki PDF Task")
-                continue
-
-            pdf_bin = _post_process_pdf(None, groups)
-            if not pdf_bin:
-                frappe.log_error(f"PDF generation returned empty for lang={lang_code}", "Wiki PDF Task")
-                continue
-
-            # Save or update the cached file: delete old and insert new
-            existing = frappe.db.get_value("File", {"file_name": cache_fname}, "name")
-            if existing:
-                frappe.delete_doc("File", existing, ignore_permissions=True, force=True)
-            
-            # create and insert a new file
-            file_doc = frappe.get_doc({
-                "doctype": "File",
-                "file_name": cache_fname,
-                "content": pdf_bin,
-                "is_private": 0
+            full_number = f"{groups[-1]['number']}.{ref_counter}"
+            groups[-1]["pages"].append({
+                "number": full_number,
+                "title": translated_title,
+                "anchor": f"PTOC-{full_number.replace('.', '-')}",
+                "content_html": _clean_for_pdf(translated_html)
             })
-            file_doc.insert(ignore_permissions=True)
-            
-            frappe.db.commit()
-            frappe.logger().info(f"Wiki PDF: Saved {cache_fname} successfully.")
+            ref_counter += 1
+            time.sleep(0.5)
 
-            # Pause between languages to avoid rate-limiting
-            time.sleep(3)
+        if not groups or not any(g["pages"] for g in groups):
+            frappe.logger().warning(f"Wiki PDF: No content for lang={lang_code}. Skipping.")
+            return
 
-        except Exception as e:
-            frappe.log_error(frappe.get_traceback(), f"Wiki PDF daily generation failed for lang={lang_code}")
-            continue
+        # Reconnect DB — translation can take 10-20 min causing MySQL to drop the idle connection
+        frappe.db.connect()
+
+        pdf_bin = _post_process_pdf(None, groups)
+        if not pdf_bin:
+            frappe.logger().warning(f"Wiki PDF: Empty PDF for lang={lang_code}")
+            return
+
+        existing = frappe.db.get_value("File", {"file_name": cache_fname}, "name")
+        if existing:
+            frappe.delete_doc("File", existing, ignore_permissions=True, force=True)
+
+        file_doc = frappe.get_doc({
+            "doctype": "File",
+            "file_name": cache_fname,
+            "content": pdf_bin,
+            "is_private": 0
+        })
+        file_doc.insert(ignore_permissions=True)
+        frappe.db.commit()
+        frappe.logger().info(f"Wiki PDF: Saved {cache_fname} successfully.")
+
+    except Exception:
+        # Use frappe.logger() instead of frappe.log_error so we don't depend on a live DB connection
+        frappe.logger().error(f"Wiki PDF generation failed for lang={lang_code}: {frappe.get_traceback()}")
+
+
+def generate_daily_translated_pdfs():
+    """
+    Frappe daily scheduled task.
+    Enqueues one background job per language so each runs independently.
+    """
+    frappe.logger().info("Wiki PDF: Enqueueing per-language PDF generation jobs...")
+    for lang in TARGET_LANGUAGES:
+        frappe.enqueue(
+            "wiki_pdf.tasks.generate_pdf_for_single_language",
+            lang=lang,
+            queue="long",
+            timeout=7200,
+        )
+    frappe.logger().info(f"Wiki PDF: Enqueued {len(TARGET_LANGUAGES)} language jobs.")
+
 
 def ensure_pdf_caches_exist():
     """
-    Called on server boot (startup hook).
-    If any language PDF is missing from File doctype, enqueue background generation.
-    This ensures cloud deployments always have cached PDFs.
+    Called on login (on_login hook).
+    Enqueues a separate background job for each missing language PDF.
     """
     try:
         from wiki_pdf.pdf import get_normalized_lang
@@ -150,18 +149,20 @@ def ensure_pdf_caches_exist():
             lang_code = get_normalized_lang(lang)
             cache_fname = f"WikiPDF_DailyCache_{lang_code}.pdf"
             if not frappe.db.exists("File", {"file_name": cache_fname}):
-                missing.append(lang_code)
+                missing.append(lang)
 
         if missing:
-            frappe.logger().info(f"Wiki PDF: Missing PDFs for {missing}. Enqueueing generation...")
-            frappe.enqueue(
-                "wiki_pdf.tasks.generate_daily_translated_pdfs",
-                queue="long",
-                timeout=7200,
-                enqueue_after_commit=True
-            )
+            frappe.logger().info(f"Wiki PDF: Missing PDFs for {[get_normalized_lang(l) for l in missing]}. Enqueueing...")
+            for lang in missing:
+                frappe.enqueue(
+                    "wiki_pdf.tasks.generate_pdf_for_single_language",
+                    lang=lang,
+                    queue="long",
+                    timeout=7200,
+                    enqueue_after_commit=True,
+                )
         else:
-            frappe.logger().info("Wiki PDF: All language PDFs already cached. No action needed.")
+            frappe.logger().info("Wiki PDF: All language PDFs already cached.")
     except Exception as e:
         frappe.logger().warning(f"Wiki PDF startup check failed: {e}")
 
