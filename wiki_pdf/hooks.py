@@ -8,3 +8,12 @@ app_email = "mercy.selvanayagi@azimpremjifoundation.org"
 app_license = "MIT"
 
 web_include_js = "/assets/wiki_pdf/js/wiki_pdf.js"
+
+scheduler_events = {
+    "daily": [
+        "wiki_pdf.tasks.generate_daily_translated_pdfs"
+    ]
+}
+
+# Runs on first request after server start - auto-generates missing PDFs on cloud deploy
+on_login = "wiki_pdf.tasks.ensure_pdf_caches_exist"

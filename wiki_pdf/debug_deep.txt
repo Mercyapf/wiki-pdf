@@ -1,0 +1,6 @@
+A
+B
+C lang=kn
+D translating Home
+D translating Design
+D translating Roles

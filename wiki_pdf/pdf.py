@@ -16,11 +16,34 @@ from frappe import _
 
 
 # ✅ ADD THIS BLOCK HERE ↓↓↓
-from googletrans import Translator
+import httpx
+from bs4 import BeautifulSoup, NavigableString
+from googletrans import Translator, LANGUAGES
 
-translator = Translator()
+# Increase timeout to 60 seconds to prevent read timeouts on large texts
+translator = Translator(timeout=httpx.Timeout(60.0))
+
+def get_normalized_lang(lang):
+    if not lang or lang == "en":
+        return "en"
+    lang = str(lang).lower().strip()
+    
+    # If the language isn't directly in the googletrans dict
+    if lang not in LANGUAGES:
+        base_lang = lang.split('-')[0]
+        if base_lang in LANGUAGES:
+            lang = base_lang
+        elif 'zh' in lang:
+            lang = 'zh-cn'
+        
+    # Monkeypatch the LANGUAGES dict so googletrans won't crash with ValueError
+    if lang not in LANGUAGES:
+        LANGUAGES[lang] = lang
+        
+    return lang
 
 def translate_text(text, lang="en"):
+    lang = get_normalized_lang(lang)
     if not text or lang == "en":
         return text
 
@@ -36,8 +59,124 @@ def translate_text(text, lang="en"):
         return "".join(translated_chunks)
 
     except Exception as e:
-        frappe.log_error(f"Translation failed: {str(e)}", "Translation Error")
+        frappe.log_error(f"Translation failed for lang {lang}: {str(e)}", "Translation Error")
         return text
+
+def _recreate_translator():
+    """Recreate the global translator instance to fix stale connections."""
+    try:
+        import httpx as _httpx
+        from googletrans import Translator as _Tr
+        globals()['translator'] = _Tr(timeout=_httpx.Timeout(60.0))
+    except Exception:
+        pass
+
+
+def _translate_single_node(text, lang, retries=3):
+    """Translate a single text node with retry. Returns original text on failure."""
+    import time
+    for attempt in range(retries):
+        try:
+            result = translator.translate(text, dest=lang)
+            if result is not None and result.text is not None:
+                return result.text
+            raise ValueError("Translator returned None")
+        except Exception as e:
+            _recreate_translator()
+            if attempt < retries - 1:
+                time.sleep(2 * (attempt + 1))
+            else:
+                frappe.log_error(f"Single-node translation failed (lang={lang}): {str(e)}", "Translation Error")
+    return text  # fallback to original
+
+
+def translate_html(html_content, lang="en"):
+    """
+    Translates only the textual content of HTML nodes.
+    Prevents Google Translate from destroying markdown/html structure (e.g. tables).
+    Uses _XX_ as a delimiter to batch-translate text nodes in one API call.
+    """
+    import time
+    lang = get_normalized_lang(lang)
+    if not html_content or lang == "en":
+        return html_content
+
+    try:
+        soup = BeautifulSoup(html_content, "html.parser")
+
+        # Gather all visible string nodes that actually have text
+        nodes_to_translate = []
+        texts_to_translate = []
+        for node in soup.find_all(string=True):
+            # Skip empty nodes, script/style content, comments
+            if node.parent.name in ['style', 'script', 'head', 'title', 'meta', '[document]']:
+                continue
+            text = str(node).strip()
+            if text and not text.isnumeric():
+                nodes_to_translate.append(node)
+                texts_to_translate.append(str(node))
+
+        if not texts_to_translate:
+            return html_content
+
+        DELIMITER = "\n\n_XX_\n\n"
+        MAX_LEN = 3500
+
+        batches = []
+        current_batch_nodes = []
+        current_batch_texts = []
+        current_len = 0
+
+        for node, text in zip(nodes_to_translate, texts_to_translate):
+            text_len = len(text) + len(DELIMITER)
+            if current_len + text_len > MAX_LEN and current_batch_texts:
+                batches.append((current_batch_nodes, current_batch_texts))
+                current_batch_nodes = []
+                current_batch_texts = []
+                current_len = 0
+            current_batch_nodes.append(node)
+            current_batch_texts.append(text)
+            current_len += text_len
+
+        if current_batch_texts:
+            batches.append((current_batch_nodes, current_batch_texts))
+
+        for batch_nodes, batch_texts in batches:
+            combined_text = DELIMITER.join(batch_texts)
+            retry = 0
+            translated_combined = combined_text
+
+            while retry < 3:
+                try:
+                    result = translator.translate(combined_text, dest=lang)
+                    if result is None or result.text is None:
+                        raise ValueError("Translator returned None")
+                    translated_combined = result.text
+                    break
+                except Exception as te:
+                    retry += 1
+                    _recreate_translator()
+                    if retry < 3:
+                        time.sleep(2 * retry)
+                    else:
+                        frappe.log_error(f"Chunk translation failed (lang={lang}): {str(te)}", "Translation Error")
+
+            # Split back — Google may alter spacing around _XX_ so we use a tolerant split
+            translated_split = [part.strip() for part in translated_combined.split("_XX_")]
+
+            # Safe replacement: if sizes mismatch keep original for that node
+            for i, node in enumerate(batch_nodes):
+                if i < len(translated_split):
+                    node.replace_with(translated_split[i])
+                else:
+                    node.replace_with(batch_texts[i])
+
+        return str(soup)
+    except Exception as e:
+        import traceback
+        frappe.log_error(f"HTML Translation failed for lang {lang}:\n{traceback.format_exc()}", "Translation Error")
+        return html_content
+
 # ✅ END HERE ↑↑↑
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -486,6 +625,23 @@ function subst() {
 <div style="font-family:Georgia,serif;font-size:10pt;text-align:center;width:100%;"><span class="page"></span></div>
 </body></html>"""
 
+def _save_pdf_to_cache(cache_fname, pdf_bin):
+    """Persist a generated PDF binary as a private Frappe File document."""
+    existing = frappe.db.get_value("File", {"file_name": cache_fname}, "name")
+    if existing:
+        # Update existing
+        file_doc = frappe.get_doc("File", existing)
+        file_doc.content = pdf_bin
+        file_doc.save(ignore_permissions=True)
+    else:
+        frappe.get_doc({
+            "doctype": "File",
+            "file_name": cache_fname,
+            "content": pdf_bin,
+            "is_private": 0
+        }).insert(ignore_permissions=True)
+    frappe.db.commit()
+
 def _write_footer():
     return None # Unpatched QT doesn't support this
 
@@ -497,7 +653,10 @@ def _pdf_options(footer_path, toc_xsl_path=None):
         "page-size": "A4", "margin-top": "15mm", "margin-bottom": "18mm", "margin-left": "18mm", "margin-right": "18mm",
         "encoding": "UTF-8", "quiet": "", "enable-local-file-access": "", 
         "enable-external-links": "", "no-stop-slow-scripts": "",
-        "load-error-handling": "ignore", "load-media-error-handling": "ignore"
+        "load-error-handling": "ignore", "load-media-error-handling": "ignore",
+        # Reduce image DPI to keep file size smaller
+        "image-dpi": "96",
+        "image-quality": "70",
     }
     return opts
 
@@ -593,6 +752,22 @@ def download_wiki_pdf(page_name=None, route=None, lang="en"):
         if not target_name:
             frappe.throw(f"Wiki Page not found: {route or page_name}")
 
+        # ✅ CHECK CACHE FIRST (daily pre-generated takes priority)
+        lang_code = get_normalized_lang(lang)
+        fallback_cache_fname = f"WikiPDF_Cached_{target_name.replace(' ', '_')}_{lang_code}.pdf"
+        # Order: daily cache > per-page cache
+        for cache_fname in [
+            f"WikiPDF_DailyCache_{lang_code}.pdf",
+            fallback_cache_fname
+        ]:
+            file_doc_name = frappe.db.get_value("File", {"file_name": cache_fname}, "name")
+            if file_doc_name:
+                cached_file = frappe.get_doc("File", file_doc_name)
+                frappe.local.response.filename = "Creche_Guideline.pdf"
+                frappe.local.response.filecontent = cached_file.get_content()
+                frappe.local.response.type = "download"
+                return
+
         page_doc = frappe.get_doc("Wiki Page", target_name, ignore_permissions=True)
         wiki_group_item = frappe.db.get_value(
             "Wiki Group Item",
@@ -605,21 +780,19 @@ def download_wiki_pdf(page_name=None, route=None, lang="en"):
 
         # ✅ CASE 1: Single page
         if not wiki_group_item:
-            raw_content = page_doc.content or ""
+            raw_html = _md_to_html(page_doc.content or "")
             if lang and lang != "en":
-                translated_content = translate_text(raw_content, lang)
+                translated_html = translate_html(raw_html, lang)
                 translated_title = translate_text(page_doc.title, lang)
             else:
-                translated_content = raw_content
+                translated_html = raw_html
                 translated_title = page_doc.title
-            # translated_content = translate_text(raw_content, lang)
-            # translated_title = translate_text(page_doc.title, lang)
 
             groups.append({
                 "label": None,
                 "pages": [{
                     "title": translated_title,
-                    "content_html": _clean_for_pdf(_md_to_html(translated_content))
+                    "content_html": _clean_for_pdf(translated_html)
                 }]
             })
 
@@ -676,23 +849,20 @@ def download_wiki_pdf(page_name=None, route=None, lang="en"):
                     full_number = f"{groups[-1]['number']}.{ref_counter}"
 
                     # ✅ TRANSLATION
-                    raw_content = p.content or ""
+                    raw_html = _md_to_html(p.content or "")
 
-                    
-                    # translated_content = translate_text(raw_content, lang)
-                    # translated_title = translate_text(p.title, lang)
                     if lang and lang != "en":
-                        translated_content = translate_text(raw_content, lang)
+                        translated_html = translate_html(raw_html, lang)
                         translated_title = translate_text(p.title, lang)
                     else:
-                        translated_content = raw_content
+                        translated_html = raw_html
                         translated_title = p.title
 
                     groups[-1]["pages"].append({
                         "number": full_number,
                         "title": translated_title,
                         "anchor": f"PTOC-{full_number.replace('.', '-')}",
-                        "content_html": _clean_for_pdf(_md_to_html(translated_content))
+                        "content_html": _clean_for_pdf(translated_html)
                     })
 
                     ref_counter += 1
@@ -702,6 +872,12 @@ def download_wiki_pdf(page_name=None, route=None, lang="en"):
             frappe.throw(_("No content found to generate PDF"))
 
         pdf_bin = _post_process_pdf(None, groups)
+
+        # ✅ SAVE CACHE (use fallback per-page cache fname to avoid overwriting daily cache)
+        try:
+            _save_pdf_to_cache(fallback_cache_fname, pdf_bin)
+        except Exception:
+            pass
 
         filename = "Creche Guideline"
         frappe.local.response.filename = f"{filename}.pdf".replace(" ", "_")
@@ -765,6 +941,21 @@ def download_full_wiki_space(wiki_space, lang="en"):
             ignore_permissions=True
         ).name
 
+        # ✅ CHECK CACHE FIRST (daily pre-generated takes priority)
+        lang_code = get_normalized_lang(lang)
+        fallback_space_cache_fname = f"WikiPDF_SpaceCached_{root_name.replace(' ', '_')}_{lang_code}.pdf"
+        for cache_fname in [
+            f"WikiPDF_DailyCache_{lang_code}.pdf",
+            fallback_space_cache_fname
+        ]:
+            file_doc_name = frappe.db.get_value("File", {"file_name": cache_fname}, "name")
+            if file_doc_name:
+                cached_file = frappe.get_doc("File", file_doc_name)
+                frappe.local.response.filename = "Creche_Guideline.pdf"
+                frappe.local.response.filecontent = cached_file.get_content()
+                frappe.local.response.type = "download"
+                return
+
         all_pages = frappe.get_all(
             "Wiki Page",
             filters={"published": 1},
@@ -785,19 +976,19 @@ def download_full_wiki_space(wiki_space, lang="en"):
         processed_pages = []
 
         for p in pages:
-            raw_content = p.content or ""
+            raw_html = _md_to_html(p.content or "")
 
             if lang and lang != "en":
-                translated_content = translate_text(raw_content, lang)
+                translated_html = translate_html(raw_html, lang)
                 translated_title = translate_text(p.title, lang)
             else:
-                translated_content = raw_content
+                translated_html = raw_html
                 translated_title = p.title
 
             # ✅ ALWAYS append (fixed indentation)
             processed_pages.append({
                 "title": translated_title,
-                "content_html": _clean_for_pdf(_md_to_html(translated_content))
+                "content_html": _clean_for_pdf(translated_html)
             })
 
         # ✅ Generate PDF OUTSIDE loop
@@ -805,6 +996,12 @@ def download_full_wiki_space(wiki_space, lang="en"):
             "label": None,
             "pages": processed_pages
         }])
+
+        # ✅ SAVE CACHE
+        try:
+            _save_pdf_to_cache(fallback_space_cache_fname, pdf_bin)
+        except Exception:
+            pass
 
         frappe.local.response.filename = "Creche_Guideline.pdf"
         frappe.local.response.filecontent = pdf_bin
