@@ -94,7 +94,7 @@ def generate_pdf_for_single_language(lang):
             frappe.logger().warning(f"Wiki PDF: No content for lang={lang_code}. Skipping.")
             return
 
-        pdf_bin = _post_process_pdf(None, groups)
+        pdf_bin = _post_process_pdf(None, groups, lang_code=lang_code)
         if not pdf_bin:
             frappe.logger().warning(f"Wiki PDF: Empty PDF for lang={lang_code}")
             return
@@ -133,17 +133,24 @@ def generate_daily_translated_pdfs():
 def ensure_pdf_caches_exist():
     """
     Called on login (on_login hook).
-    Checks disk for missing language PDFs and enqueues generation for each missing one.
+    - For PDFs already on disk: ensures their File doctype record exists.
+    - For missing PDFs: enqueues generation.
     """
     import os
     try:
-        from wiki_pdf.pdf import get_normalized_lang
+        from wiki_pdf.pdf import get_normalized_lang, _ensure_pdf_file_record
         missing = []
         for lang in TARGET_LANGUAGES:
             lang_code = get_normalized_lang(lang)
             cache_fname = f"WikiPDF_DailyCache_{lang_code}.pdf"
             file_path = os.path.join(frappe.get_site_path("public", "files"), cache_fname)
-            if not os.path.exists(file_path):
+            if os.path.exists(file_path):
+                # File is on disk — make sure it has a File doctype record.
+                try:
+                    _ensure_pdf_file_record(cache_fname, os.path.getsize(file_path))
+                except Exception as e:
+                    frappe.logger().warning(f"Wiki PDF: Could not fix File record for {cache_fname}: {e}")
+            else:
                 missing.append(lang)
 
         if missing:
@@ -165,7 +172,7 @@ def ensure_pdf_caches_exist():
                         enqueue_after_commit=True,
                     )
         else:
-            frappe.logger().info("Wiki PDF: All language PDFs already cached.")
+            frappe.logger().info("Wiki PDF: All language PDFs cached and File records verified.")
     except Exception as e:
         frappe.logger().warning(f"Wiki PDF startup check failed: {e}")
 

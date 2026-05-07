@@ -358,6 +358,31 @@ pre, code { background: #f4f4f4; font-family: monospace; border-radius: 3px; }
 pre { padding: 8pt; border: 1px solid #ddd; white-space: pre-wrap; margin: 6pt 0; page-break-inside: avoid; }
 """
 
+TOC_TITLES = {
+    "en": "Table of Contents",
+    "kn": "ವಿಷಯ ಸೂಚಿ",
+    "ta": "உள்ளடக்கம்",
+    "hi": "विषय-सूची",
+    "te": "విషయ సూచిక",
+    "mr": "अनुक्रमणिका",
+    "bn": "সূচিপত্র",
+    "gu": "સામગ્રી સૂચિ",
+    "ml": "ഉള്ളടക്കം",
+    "ur": "فہرست مضامین",
+    "pa": "ਸਮੱਗਰੀ ਸੂਚੀ",
+    "or": "ବିଷୟ ସୂଚୀ",
+    "as": "বিষয়বস্তুৰ তালিকা",
+    "sa": "विषयसूची",
+    "gom": "विषय सूची",
+    "doi": "विषय-सूची",
+    "mai": "विषय-सूची",
+    "mni-Mtei": "ꯋꯥꯈꯜ ꯑꯣꯏꯕꯒꯤ ꯄꯨꯛꯊꯣꯀꯄꯥ",
+    "ne": "सामग्री तालिका",
+    "sat": "ᱥᱟᱹᱦᱩᱛ ᱛᱟᱞᱤᱠᱟ",
+    "sd": "مواد جي فهرست",
+    "tcy": "ಪರಿವಿಡಿ",
+}
+
 # डिजाइन टोकन for manual TOC
 TOC_STYLE = """
 <style>
@@ -438,7 +463,7 @@ def _add_page_numbers(pdf_bin, skip_first=False, skip_last=False, skip_count=1):
         frappe.log_error(f"Page numbering error: {str(e)}", "Wiki PDF Error")
         return pdf_bin
 
-def _post_process_pdf(main_html, groups):
+def _post_process_pdf(main_html, groups, lang_code="en"):
     """Generates PDF with manual TOC post-processing."""
     # 1. Add invisible anchors to groups and pages
     anchor_html = []
@@ -555,7 +580,8 @@ def _post_process_pdf(main_html, groups):
                 
     # 4. Generate TOC PDF
     def build_toc(shift=0):
-        toc_lines = ['<h1>Table of Contents</h1><div class="toc-container">']
+        toc_title = TOC_TITLES.get(lang_code, "Table of Contents")
+        toc_lines = [f'<h1>{toc_title}</h1><div class="toc-container">']
         for g_idx, group in enumerate(groups):
             if group["label"]:
                 p_num = page_map.get(group["anchor"], 1) + shift
@@ -625,61 +651,112 @@ function subst() {
 <div style="font-family:Georgia,serif;font-size:10pt;text-align:center;width:100%;"><span class="page"></span></div>
 </body></html>"""
 
-def _save_pdf_to_cache(cache_fname, pdf_bin):
-    """Write PDF to disk and create/update a File record for visibility in the File list.
-    Uses raw DB insert to bypass Frappe's before_insert hook which renames files
-    when it detects an existing file with the same name on disk.
+def _compress_pdf_gs(pdf_bin, label=""):
+    """Compress PDF with Ghostscript: subsets embedded fonts and recompresses images.
+    Reduces Indic-language PDFs from 50-80 MB down to ~10-20 MB.
+    Falls back silently to the original bytes if gs fails or makes it larger.
     """
-    import os
+    import os, subprocess, tempfile
+    tmp_in = tmp_out = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+            f.write(pdf_bin)
+            tmp_in = f.name
+        tmp_out = tmp_in + "_compressed.pdf"
+        result = subprocess.run(
+            [
+                "gs", "-sDEVICE=pdfwrite",
+                "-dCompatibilityLevel=1.4",
+                "-dPDFSETTINGS=/ebook",   # 150 dpi images + font subsetting
+                "-dEmbedAllFonts=true",
+                "-dSubsetFonts=true",
+                "-dCompressFonts=true",
+                "-dNOPAUSE", "-dQUIET", "-dBATCH",
+                f"-sOutputFile={tmp_out}", tmp_in,
+            ],
+            capture_output=True,
+            timeout=300,
+        )
+        if result.returncode == 0 and os.path.exists(tmp_out):
+            with open(tmp_out, "rb") as f:
+                compressed = f.read()
+            before_kb, after_kb = len(pdf_bin) // 1024, len(compressed) // 1024
+            frappe.logger().info(
+                f"Wiki PDF{(' ' + label) if label else ''}: gs {before_kb} KB → {after_kb} KB"
+            )
+            return compressed if len(compressed) < len(pdf_bin) else pdf_bin
+        frappe.logger().warning(
+            f"Wiki PDF: gs compression failed (rc={result.returncode}): "
+            f"{result.stderr.decode(errors='replace')[:300]}"
+        )
+    except Exception:
+        frappe.logger().warning(f"Wiki PDF: gs compression skipped: {frappe.get_traceback()[:300]}")
+    finally:
+        for p in (tmp_in, tmp_out):
+            if p:
+                try:
+                    os.unlink(p)
+                except Exception:
+                    pass
+    return pdf_bin
 
-    file_path = os.path.join(frappe.get_site_path("public", "files"), cache_fname)
-    with open(file_path, "wb") as f:
-        f.write(pdf_bin)
 
+def _ensure_pdf_file_record(cache_fname, file_size):
+    """Create or update the File doctype record for a PDF already on disk.
+    Uses raw SQL to bypass Frappe's before_insert hook that would rename the
+    record when it detects the physical file already exists on disk.
+    Caller is responsible for having a live DB connection.
+    """
     file_url = f"/files/{cache_fname}"
-    file_size = len(pdf_bin)
     user = frappe.session.user
     if not user or user == "Guest":
         user = "Administrator"
     now = frappe.utils.now_datetime()
 
-    # Reconnect here (not before PDF generation) so the connection is fresh
-    # when we actually need the DB — cloud MySQL drops idle connections after
-    # long PDF-generation runs.
-    try:
-        frappe.db.connect()
-    except Exception:
-        pass  # already connected; ignore
+    existing = frappe.db.get_value("File", {"file_url": file_url}, "name")
+    if existing:
+        frappe.db.set_value("File", existing, {
+            "file_name": cache_fname,
+            "file_size": file_size,
+        })
+    else:
+        frappe.db.sql("""
+            INSERT INTO `tabFile`
+                (name, owner, creation, modified, modified_by,
+                 file_name, file_url, file_size, is_private, folder)
+            VALUES
+                (%(name)s, %(user)s, %(now)s, %(now)s, %(user)s,
+                 %(file_name)s, %(file_url)s, %(file_size)s, 0, 'Home/Attachments')
+        """, {
+            "name": frappe.generate_hash(length=10),
+            "user": user,
+            "now": now,
+            "file_name": cache_fname,
+            "file_url": file_url,
+            "file_size": file_size,
+        })
+    frappe.db.commit()
 
+
+def _save_pdf_to_cache(cache_fname, pdf_bin):
+    """Compress, write PDF to disk, then ensure a File record exists."""
+    import os
+
+    pdf_bin = _compress_pdf_gs(pdf_bin, label=cache_fname)
+
+    file_path = os.path.join(frappe.get_site_path("public", "files"), cache_fname)
+    with open(file_path, "wb") as f:
+        f.write(pdf_bin)
+
+    # Ping the DB to check the connection is still alive after the long
+    # translation + generation run. If dead, reconnect. Let any failure from
+    # connect() propagate to the caller (tasks.py logs it properly).
     try:
-        existing = frappe.db.get_value("File", {"file_url": file_url}, "name")
-        if existing:
-            frappe.db.set_value("File", existing, {
-                "file_name": cache_fname,
-                "file_size": file_size,
-            })
-        else:
-            frappe.db.sql("""
-                INSERT INTO `tabFile`
-                    (name, owner, creation, modified, modified_by,
-                     file_name, file_url, file_size, is_private, folder)
-                VALUES
-                    (%(name)s, %(user)s, %(now)s, %(now)s, %(user)s,
-                     %(file_name)s, %(file_url)s, %(file_size)s, 0, 'Home/Attachments')
-            """, {
-                "name": frappe.generate_hash(length=10),
-                "user": user,
-                "now": now,
-                "file_name": cache_fname,
-                "file_url": file_url,
-                "file_size": file_size,
-            })
-        frappe.db.commit()
+        frappe.db.sql("SELECT 1")
     except Exception:
-        frappe.log_error(
-            frappe.get_traceback(),
-            f"Wiki PDF: Failed to create File record for {cache_fname}"
-        )
+        frappe.db.connect()
+
+    _ensure_pdf_file_record(cache_fname, len(pdf_bin))
 
 
 def _load_pdf_from_cache(cache_fname):
@@ -810,20 +887,25 @@ def download_wiki_pdf(page_name=None, route=None, lang="en"):
             frappe.local.response.type = "download"
             return
 
-        # Not cached — enqueue generation only if not already running
+        # Not cached — enqueue generation only if not already running.
+        # Use Redis cache as primary lock (DB check has a race condition when
+        # multiple requests arrive before the enqueue commits to tabRQ Job).
         job_name = f"wiki_pdf_generate_{lang_code}"
-        already_queued = frappe.db.exists("RQ Job", {
-            "job_name": job_name,
-            "status": ["in", ["queued", "started"]]
-        })
-        if not already_queued:
-            frappe.enqueue(
-                "wiki_pdf.tasks.generate_pdf_for_single_language",
-                lang=lang_code,
-                queue="long",
-                timeout=7200,
-                job_name=job_name,
-            )
+        cache_key = f"wiki_pdf_enqueueing_{job_name}"
+        if not frappe.cache().get_value(cache_key):
+            already_queued = frappe.db.exists("RQ Job", {
+                "job_name": job_name,
+                "status": ["in", ["queued", "started"]],
+            })
+            if not already_queued:
+                frappe.enqueue(
+                    "wiki_pdf.tasks.generate_pdf_for_single_language",
+                    lang=lang_code,
+                    queue="long",
+                    timeout=7200,
+                    job_name=job_name,
+                )
+            frappe.cache().set_value(cache_key, True, expires_in_sec=300)
         frappe.throw(
             "The PDF for this language is being prepared in the background. "
             "Please try again in a few minutes."
@@ -834,6 +916,29 @@ def download_wiki_pdf(page_name=None, route=None, lang="en"):
     except Exception as e:
         frappe.log_error(frappe.get_traceback(), "Wiki PDF Error")
         frappe.throw(f"Error: {str(e)}")
+
+
+@frappe.whitelist()
+def clear_wiki_pdf_cache():
+    """Delete all cached Wiki PDFs from disk and re-enqueue generation for all languages.
+    Use this to force a full regeneration (e.g. after a TOC or content fix).
+    Call from browser console: frappe.call('wiki_pdf.pdf.clear_wiki_pdf_cache')
+    """
+    import os
+    from wiki_pdf.tasks import TARGET_LANGUAGES, generate_daily_translated_pdfs
+
+    deleted = []
+    for lang in TARGET_LANGUAGES:
+        lang_code = get_normalized_lang(lang)
+        cache_fname = f"WikiPDF_DailyCache_{lang_code}.pdf"
+        file_path = os.path.join(frappe.get_site_path("public", "files"), cache_fname)
+        if os.path.exists(file_path):
+            os.unlink(file_path)
+            deleted.append(lang_code)
+
+    generate_daily_translated_pdfs()
+    return f"Deleted {len(deleted)} cached PDFs. Generation jobs enqueued for all {len(TARGET_LANGUAGES)} languages."
+
 
 # @frappe.whitelist(allow_guest=True)
 # # def download_full_wiki_space(wiki_space):
