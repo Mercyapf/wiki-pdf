@@ -381,7 +381,7 @@ TOC_TITLES = {
     "gom": "विषय सूची",
     "doi": "विषय-सूची",
     "mai": "विषय-सूची",
-    "mni-Mtei": "ꯋꯥꯈꯜ ꯑꯣꯏꯕꯒꯤ ꯄꯨꯛꯊꯣꯀꯄꯥ",
+    "mni-mtei": "ꯋꯥꯈꯜ ꯑꯣꯏꯕꯒꯤ ꯄꯨꯛꯊꯣꯀꯄꯥ",
     "ne": "सामग्री तालिका",
     "sat": "ᱥᱟᱹᱦᱩᱛ ᱛᱟᱞᱤᱠᱟ",
     "sd": "مواد جي فهرست",
@@ -877,20 +877,18 @@ def download_wiki_pdf(page_name=None, route=None, lang="en"):
             frappe.local.response.type = "download"
             return
 
-        # Not cached — enqueue generation only if not already running
-        job_name = f"wiki_pdf_generate_{lang_code}"
-        already_queued = frappe.db.exists("RQ Job", {
-            "job_name": job_name,
-            "status": ["in", ["queued", "started"]]
-        })
-        if not already_queued:
+        # Not cached — enqueue generation only if not already running.
+        # Use the same Redis lock as tasks.py to prevent duplicates.
+        redis_key = f"wiki_pdf_active_{lang_code}"
+        if not frappe.cache().get_value(redis_key):
             frappe.enqueue(
                 "wiki_pdf.tasks.generate_pdf_for_single_language",
                 lang=lang_code,
                 queue="long",
                 timeout=7200,
-                job_name=job_name,
+                job_name=f"wiki_pdf_generate_{lang_code}",
             )
+            frappe.cache().set_value(redis_key, True, expires_in_sec=7200)
         frappe.throw(
             "The PDF for this language is being prepared in the background. "
             "Please try again in a few minutes."
