@@ -22,6 +22,9 @@ from googletrans import Translator, LANGUAGES
 
 # Increase timeout to 60 seconds to prevent read timeouts on large texts
 translator = Translator(timeout=httpx.Timeout(60.0))
+# Patch googletrans 4.0.0rc1 bug: attribute set as raise_exception (lowercase)
+# but referenced internally as raise_Exception (uppercase) on non-200 responses.
+translator.raise_Exception = False
 
 def get_normalized_lang(lang):
     if not lang or lang == "en":
@@ -67,7 +70,11 @@ def _recreate_translator():
     try:
         import httpx as _httpx
         from googletrans import Translator as _Tr
-        globals()['translator'] = _Tr(timeout=_httpx.Timeout(60.0))
+        t = _Tr(timeout=_httpx.Timeout(60.0))
+        # Same patch: googletrans 4.0.0rc1 sets raise_exception (lowercase) but
+        # reads raise_Exception (uppercase) on non-200 responses → AttributeError.
+        t.raise_Exception = False
+        globals()['translator'] = t
     except Exception:
         pass
 
@@ -916,6 +923,87 @@ def download_wiki_pdf(page_name=None, route=None, lang="en"):
     except Exception as e:
         frappe.log_error(frappe.get_traceback(), "Wiki PDF Error")
         frappe.throw(f"Error: {str(e)}")
+
+
+def _clear_stuck_pdf_jobs():
+    """Remove stuck/orphaned wiki_pdf jobs from Redis WITHOUT calling registry.cleanup().
+
+    The RQ Job list page crashes with:
+        ValueError: signal only works in main thread of the main interpreter
+    whenever StartedJobRegistry.cleanup() finds an abandoned job and tries to
+    execute its failure callback via UnixSignalDeathPenalty (uses SIGALRM —
+    only valid in the main thread, not gunicorn worker threads).
+
+    Root cause trace:
+      registry.get_job_ids() → cleanup() → execute_failure_callback()
+      → UnixSignalDeathPenalty.__enter__() → signal.signal(SIGALRM) → ValueError
+
+    Fix: use conn.zrange(registry.key, ...) directly — this NEVER calls
+    cleanup() — then zrem the offending entries.
+
+    Frappe v15 + RQ 1.15.1 key layout (confirmed from source):
+      Queue name  : generate_qname(qtype) = "{get_bench_id()}:{qtype}"
+                    e.g. "home-frappe-frappe-bench:long"
+      Started reg : key_template "rq:wip:{0}"    → "rq:wip:home-frappe-frappe-bench:long"
+      Failed  reg : key_template "rq:failed:{0}" → "rq:failed:home-frappe-frappe-bench:long"
+      Job hash    : redis_job_namespace_prefix "rq:job:" → "rq:job:<site>::<uuid>"
+    """
+    try:
+        from frappe.utils.background_jobs import get_redis_conn, get_queue
+        from rq.registry import StartedJobRegistry, FailedJobRegistry
+
+        conn = get_redis_conn()
+        cleared = 0
+
+        for qtype in ("default", "short", "long"):
+            try:
+                # get_queue() calls generate_qname() → "{bench_id}:{qtype}"
+                # so queue.name = "home-frappe-frappe-bench:long" etc.
+                q = get_queue(qtype)
+            except Exception:
+                continue
+
+            for RegistryClass in (StartedJobRegistry, FailedJobRegistry):
+                registry = RegistryClass(queue=q, connection=conn)
+                # registry.key = "rq:wip:home-frappe-frappe-bench:long" etc.
+                # conn.zrange bypasses cleanup() entirely — no SIGALRM risk
+                raw_ids = conn.zrange(registry.key, 0, -1)
+
+                for raw_id in raw_ids:
+                    job_id = raw_id.decode() if isinstance(raw_id, bytes) else raw_id
+                    job_key = f"rq:job:{job_id}"
+                    job_data = conn.hgetall(job_key)
+
+                    # Remove if orphaned (no hash) OR confirmed wiki_pdf job
+                    is_target = not job_data
+                    if not is_target:
+                        for val in job_data.values():
+                            if isinstance(val, bytes) and b"wiki_pdf" in val:
+                                is_target = True
+                                break
+
+                    if is_target:
+                        conn.zrem(registry.key, raw_id)
+                        if job_data:
+                            conn.delete(job_key)
+                        cleared += 1
+
+        if cleared:
+            frappe.logger().info(f"Wiki PDF: cleared {cleared} stuck/orphaned jobs from Redis.")
+        return cleared
+    except Exception as e:
+        frappe.logger().warning(f"Wiki PDF: could not clear stuck jobs: {e}")
+        return 0
+
+
+@frappe.whitelist()
+def fix_rq_job_list():
+    """Clear stuck wiki_pdf jobs from Redis so the RQ Job list page stops crashing.
+    Call once from browser console after deploying:
+        frappe.call('wiki_pdf.pdf.fix_rq_job_list').then(r => console.log(r.message))
+    """
+    cleared = _clear_stuck_pdf_jobs()
+    return f"Cleared {cleared} stuck wiki_pdf jobs. The RQ Job list should work now."
 
 
 @frappe.whitelist()

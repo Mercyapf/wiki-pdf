@@ -133,12 +133,14 @@ def generate_daily_translated_pdfs():
 def ensure_pdf_caches_exist():
     """
     Called on login (on_login hook).
+    - Clears stuck/orphaned wiki_pdf jobs from Redis (fixes RQ Job list SIGALRM crash).
     - For PDFs already on disk: ensures their File doctype record exists.
     - For missing PDFs: enqueues generation.
     """
     import os
     try:
-        from wiki_pdf.pdf import get_normalized_lang, _ensure_pdf_file_record
+        from wiki_pdf.pdf import get_normalized_lang, _ensure_pdf_file_record, _clear_stuck_pdf_jobs
+        _clear_stuck_pdf_jobs()
         missing = []
         for lang in TARGET_LANGUAGES:
             lang_code = get_normalized_lang(lang)
