@@ -17,7 +17,7 @@ def generate_pdf_for_single_language(lang):
     """
     from wiki_pdf.pdf import (
         _md_to_html, _clean_for_pdf, _post_process_pdf,
-        translate_html, get_normalized_lang
+        translate_html, get_normalized_lang, _save_pdf_to_cache
     )
 
     lang_code = get_normalized_lang(lang)
@@ -102,18 +102,7 @@ def generate_pdf_for_single_language(lang):
             frappe.logger().warning(f"Wiki PDF: Empty PDF for lang={lang_code}")
             return
 
-        existing = frappe.db.get_value("File", {"file_name": cache_fname}, "name")
-        if existing:
-            frappe.delete_doc("File", existing, ignore_permissions=True, force=True)
-
-        file_doc = frappe.get_doc({
-            "doctype": "File",
-            "file_name": cache_fname,
-            "content": pdf_bin,
-            "is_private": 0
-        })
-        file_doc.insert(ignore_permissions=True)
-        frappe.db.commit()
+        _save_pdf_to_cache(cache_fname, pdf_bin)
         frappe.logger().info(f"Wiki PDF: Saved {cache_fname} successfully.")
 
     except Exception:
@@ -128,11 +117,15 @@ def generate_daily_translated_pdfs():
     """
     frappe.logger().info("Wiki PDF: Enqueueing per-language PDF generation jobs...")
     for lang in TARGET_LANGUAGES:
+        from wiki_pdf.pdf import get_normalized_lang
+        lang_code = get_normalized_lang(lang)
+        job_name = f"wiki_pdf_generate_{lang_code}"
         frappe.enqueue(
             "wiki_pdf.tasks.generate_pdf_for_single_language",
             lang=lang,
             queue="long",
             timeout=7200,
+            job_name=job_name,
         )
     frappe.logger().info(f"Wiki PDF: Enqueued {len(TARGET_LANGUAGES)} language jobs.")
 
@@ -140,27 +133,37 @@ def generate_daily_translated_pdfs():
 def ensure_pdf_caches_exist():
     """
     Called on login (on_login hook).
-    Enqueues a separate background job for each missing language PDF.
+    Checks disk for missing language PDFs and enqueues generation for each missing one.
     """
+    import os
     try:
         from wiki_pdf.pdf import get_normalized_lang
         missing = []
         for lang in TARGET_LANGUAGES:
             lang_code = get_normalized_lang(lang)
             cache_fname = f"WikiPDF_DailyCache_{lang_code}.pdf"
-            if not frappe.db.exists("File", {"file_name": cache_fname}):
+            file_path = os.path.join(frappe.get_site_path("public", "files"), cache_fname)
+            if not os.path.exists(file_path):
                 missing.append(lang)
 
         if missing:
             frappe.logger().info(f"Wiki PDF: Missing PDFs for {[get_normalized_lang(l) for l in missing]}. Enqueueing...")
             for lang in missing:
-                frappe.enqueue(
-                    "wiki_pdf.tasks.generate_pdf_for_single_language",
-                    lang=lang,
-                    queue="long",
-                    timeout=7200,
-                    enqueue_after_commit=True,
-                )
+                lang_code = get_normalized_lang(lang)
+                job_name = f"wiki_pdf_generate_{lang_code}"
+                already_queued = frappe.db.exists("RQ Job", {
+                    "job_name": job_name,
+                    "status": ["in", ["queued", "started"]]
+                })
+                if not already_queued:
+                    frappe.enqueue(
+                        "wiki_pdf.tasks.generate_pdf_for_single_language",
+                        lang=lang,
+                        queue="long",
+                        timeout=7200,
+                        job_name=job_name,
+                        enqueue_after_commit=True,
+                    )
         else:
             frappe.logger().info("Wiki PDF: All language PDFs already cached.")
     except Exception as e:

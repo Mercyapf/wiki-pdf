@@ -59,7 +59,7 @@ def translate_text(text, lang="en"):
         return "".join(translated_chunks)
 
     except Exception as e:
-        frappe.log_error(f"Translation failed for lang {lang}: {str(e)}", "Translation Error")
+        frappe.logger().warning(f"Translation failed for lang {lang}: {e}")
         return text
 
 def _recreate_translator():
@@ -626,21 +626,54 @@ function subst() {
 </body></html>"""
 
 def _save_pdf_to_cache(cache_fname, pdf_bin):
-    """Persist a generated PDF binary as a private Frappe File document."""
-    existing = frappe.db.get_value("File", {"file_name": cache_fname}, "name")
+    """Write PDF to disk and create/update a File record for visibility in the File list.
+    Uses raw DB insert to bypass Frappe's before_insert hook which renames files
+    when it detects an existing file with the same name on disk.
+    """
+    import os
+
+    file_path = os.path.join(frappe.get_site_path("public", "files"), cache_fname)
+    with open(file_path, "wb") as f:
+        f.write(pdf_bin)
+
+    file_url = f"/files/{cache_fname}"
+    file_size = len(pdf_bin)
+    user = frappe.session.user or "Administrator"
+    now = frappe.utils.now_datetime()
+
+    existing = frappe.db.get_value("File", {"file_url": file_url}, "name")
     if existing:
-        # Update existing
-        file_doc = frappe.get_doc("File", existing)
-        file_doc.content = pdf_bin
-        file_doc.save(ignore_permissions=True)
-    else:
-        frappe.get_doc({
-            "doctype": "File",
+        frappe.db.set_value("File", existing, {
             "file_name": cache_fname,
-            "content": pdf_bin,
-            "is_private": 0
-        }).insert(ignore_permissions=True)
+            "file_size": file_size,
+        })
+    else:
+        frappe.db.sql("""
+            INSERT INTO `tabFile`
+                (name, owner, creation, modified, modified_by,
+                 file_name, file_url, file_size, is_private, folder)
+            VALUES
+                (%(name)s, %(user)s, %(now)s, %(now)s, %(user)s,
+                 %(file_name)s, %(file_url)s, %(file_size)s, 0, 'Home/Attachments')
+        """, {
+            "name": frappe.generate_hash(length=10),
+            "user": user,
+            "now": now,
+            "file_name": cache_fname,
+            "file_url": file_url,
+            "file_size": file_size,
+        })
     frappe.db.commit()
+
+
+def _load_pdf_from_cache(cache_fname):
+    """Read cached PDF bytes from disk. Returns None if not found."""
+    import os
+    file_path = os.path.join(frappe.get_site_path("public", "files"), cache_fname)
+    if os.path.exists(file_path):
+        with open(file_path, "rb") as f:
+            return f.read()
+    return None
 
 def _write_footer():
     return None # Unpatched QT doesn't support this
@@ -752,138 +785,36 @@ def download_wiki_pdf(page_name=None, route=None, lang="en"):
         if not target_name:
             frappe.throw(f"Wiki Page not found: {route or page_name}")
 
-        # ✅ CHECK CACHE FIRST (daily pre-generated takes priority)
+        # Check disk cache — read directly from public/files to avoid File doctype renaming issues
         lang_code = get_normalized_lang(lang)
-        fallback_cache_fname = f"WikiPDF_Cached_{target_name.replace(' ', '_')}_{lang_code}.pdf"
-        # Order: daily cache > per-page cache
-        for cache_fname in [
-            f"WikiPDF_DailyCache_{lang_code}.pdf",
-            fallback_cache_fname
-        ]:
-            file_doc_name = frappe.db.get_value("File", {"file_name": cache_fname}, "name")
-            if file_doc_name:
-                cached_file = frappe.get_doc("File", file_doc_name)
-                frappe.local.response.filename = "Creche_Guideline.pdf"
-                frappe.local.response.filecontent = cached_file.get_content()
-                frappe.local.response.type = "download"
-                return
+        pdf_bin = _load_pdf_from_cache(f"WikiPDF_DailyCache_{lang_code}.pdf")
+        if pdf_bin:
+            frappe.local.response.filename = "Creche_Guideline.pdf"
+            frappe.local.response.filecontent = pdf_bin
+            frappe.local.response.type = "download"
+            return
 
-        page_doc = frappe.get_doc("Wiki Page", target_name, ignore_permissions=True)
-        wiki_group_item = frappe.db.get_value(
-            "Wiki Group Item",
-            {"wiki_page": target_name},
-            ["parent"],
-            as_dict=True
+        # Not cached — enqueue generation only if not already running
+        job_name = f"wiki_pdf_generate_{lang_code}"
+        already_queued = frappe.db.exists("RQ Job", {
+            "job_name": job_name,
+            "status": ["in", ["queued", "started"]]
+        })
+        if not already_queued:
+            frappe.enqueue(
+                "wiki_pdf.tasks.generate_pdf_for_single_language",
+                lang=lang_code,
+                queue="long",
+                timeout=7200,
+                job_name=job_name,
+            )
+        frappe.throw(
+            "The PDF for this language is being prepared in the background. "
+            "Please try again in a few minutes."
         )
 
-        groups = []
-
-        # ✅ CASE 1: Single page
-        if not wiki_group_item:
-            raw_html = _md_to_html(page_doc.content or "")
-            if lang and lang != "en":
-                translated_html = translate_html(raw_html, lang)
-                translated_title = translate_text(page_doc.title, lang)
-            else:
-                translated_html = raw_html
-                translated_title = page_doc.title
-
-            groups.append({
-                "label": None,
-                "pages": [{
-                    "title": translated_title,
-                    "content_html": _clean_for_pdf(translated_html)
-                }]
-            })
-
-        # ✅ CASE 2: Group pages
-        else:
-            sidebar = frappe.get_all(
-                "Wiki Group Item",
-                filters={"parent": wiki_group_item.parent},
-                fields=["wiki_page", "parent_label"],
-                order_by="idx asc",
-                ignore_permissions=True,
-                limit=0
-            )
-
-            p_names = [s.wiki_page for s in sidebar if s.wiki_page]
-
-            p_map = {
-                p.name: p for p in frappe.get_all(
-                    "Wiki Page",
-                    filters={"name": ["in", p_names]},
-                    fields=["name", "title", "content"],
-                    ignore_permissions=True,
-                    limit=0
-                )
-            }
-
-            group_counter = 1
-
-            for s in sidebar:
-                if s.wiki_page in p_map:
-                    p = p_map[s.wiki_page]
-                    label = s.parent_label or ""
-
-                    # if not groups or groups[-1]["label"] != label:
-                    #     groups.append({
-                    #         "label": label,
-                    #         "number": group_counter,
-                    #         "anchor": f"GTOC-{group_counter}",
-                    #         "pages": []
-                    #     })
-                    #     group_counter += 1
-                    #     ref_counter = 1
-
-                    if not groups or groups[-1]["label"] != label:
-                     groups.append({
-                      "label": label,
-                      "number": group_counter,
-                      "anchor": f"GTOC-{group_counter}",
-                      "pages": []
-                     })
-                     group_counter += 1
-                     ref_counter = 1
-
-                    full_number = f"{groups[-1]['number']}.{ref_counter}"
-
-                    # ✅ TRANSLATION
-                    raw_html = _md_to_html(p.content or "")
-
-                    if lang and lang != "en":
-                        translated_html = translate_html(raw_html, lang)
-                        translated_title = translate_text(p.title, lang)
-                    else:
-                        translated_html = raw_html
-                        translated_title = p.title
-
-                    groups[-1]["pages"].append({
-                        "number": full_number,
-                        "title": translated_title,
-                        "anchor": f"PTOC-{full_number.replace('.', '-')}",
-                        "content_html": _clean_for_pdf(translated_html)
-                    })
-
-                    ref_counter += 1
-
-        # ✅ FINAL CHECK (outside loop)
-        if not groups or not any(g["pages"] for g in groups):
-            frappe.throw(_("No content found to generate PDF"))
-
-        pdf_bin = _post_process_pdf(None, groups)
-
-        # ✅ SAVE CACHE (use fallback per-page cache fname to avoid overwriting daily cache)
-        try:
-            _save_pdf_to_cache(fallback_cache_fname, pdf_bin)
-        except Exception:
-            pass
-
-        filename = "Creche Guideline"
-        frappe.local.response.filename = f"{filename}.pdf".replace(" ", "_")
-        frappe.local.response.filecontent = pdf_bin
-        frappe.local.response.type = "download"
-
+    except frappe.exceptions.ValidationError:
+        raise
     except Exception as e:
         frappe.log_error(frappe.get_traceback(), "Wiki PDF Error")
         frappe.throw(f"Error: {str(e)}")
