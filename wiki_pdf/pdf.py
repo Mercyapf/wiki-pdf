@@ -20,10 +20,11 @@ import httpx
 from bs4 import BeautifulSoup, NavigableString
 from googletrans import Translator, LANGUAGES
 
-# Increase timeout to 60 seconds to prevent read timeouts on large texts
-translator = Translator(timeout=httpx.Timeout(60.0))
 # Fix googletrans 4.0.0rc1 bug: stores raise_exception (lowercase) but reads
 # raise_Exception (uppercase E) on non-200 responses → AttributeError.
+# Patch the class so every Translator instance gets the default, not just ours.
+Translator.raise_Exception = False
+translator = Translator(timeout=httpx.Timeout(60.0))
 translator.raise_Exception = False
 
 def get_normalized_lang(lang):
@@ -70,6 +71,7 @@ def _recreate_translator():
     try:
         import httpx as _httpx
         from googletrans import Translator as _Tr
+        _Tr.raise_Exception = False
         t = _Tr(timeout=_httpx.Timeout(60.0))
         t.raise_Exception = False
         globals()['translator'] = t
@@ -124,7 +126,7 @@ def translate_html(html_content, lang="en"):
         if not texts_to_translate:
             return html_content
 
-        DELIMITER = "\n\n_XX_\n\n"
+        DELIMITER = "\n||||\n"
         MAX_LEN = 3500
 
         batches = []
@@ -166,8 +168,7 @@ def translate_html(html_content, lang="en"):
                     else:
                         frappe.log_error(f"Chunk translation failed (lang={lang}): {str(te)}", "Translation Error")
 
-            # Split back — Google may alter spacing around _XX_ so we use a tolerant split
-            translated_split = [part.strip() for part in translated_combined.split("_XX_")]
+            translated_split = [part.strip() for part in translated_combined.split("||||")]
 
             # Safe replacement: if sizes mismatch keep original for that node
             for i, node in enumerate(batch_nodes):
@@ -344,7 +345,7 @@ def _clean_for_pdf(html):
 
 PDF_CSS = """
 @page { size: A4; margin: 15mm 18mm; }
-body { font-family: Georgia, serif; font-size: 11pt; line-height: 1.4; color: #111; margin: 0; padding: 0; }
+body { font-family: 'Noto Sans Telugu', 'Noto Sans Kannada', 'Noto Sans Tamil', 'Noto Sans Devanagari', 'Noto Sans Bengali', 'Noto Sans Malayalam', 'Noto Sans Gujarati', 'Noto Sans Gurmukhi', 'Noto Sans Oriya', 'Noto Sans Arabic', Georgia, serif; font-size: 11pt; line-height: 1.4; color: #111; margin: 0; padding: 0; }
 h1.group-name { font-size: 22pt; font-weight: bold; border-bottom: 2px solid #333; padding-bottom: 4pt; margin-bottom: 14pt; page-break-after: avoid !important; }
 h1.page-title, h2.page-title { color: #1a52a0; font-size: 22pt; font-weight: bold; margin-bottom: 12pt; page-break-after: avoid !important; }
 h1 { font-size: 18pt; color: #222; margin-top: 14pt; margin-bottom: 6pt; page-break-after: avoid !important; }
@@ -391,7 +392,7 @@ TOC_TITLES = {
 # डिजाइन टोकन for manual TOC
 TOC_STYLE = """
 <style>
-    body { font-family: Georgia, serif; padding: 20mm; margin: 0; color: #111; }
+    body { font-family: 'Noto Sans Telugu', 'Noto Sans Kannada', 'Noto Sans Tamil', 'Noto Sans Devanagari', 'Noto Sans Bengali', 'Noto Sans Malayalam', 'Noto Sans Gujarati', 'Noto Sans Gurmukhi', 'Noto Sans Oriya', 'Noto Sans Arabic', Georgia, serif; padding: 20mm; margin: 0; color: #111; }
     h1 { font-size: 24pt; font-weight: bold; border-bottom: 2px solid #333; padding-bottom: 10px; margin-bottom: 30px; }
     .toc-container { width: 100%; }
     .toc-item { clear: both; overflow: hidden; margin-bottom: 12pt; line-height: 1.2; }
