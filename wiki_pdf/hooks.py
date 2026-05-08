@@ -18,5 +18,3 @@ doc_events = {
     }
 }
 
-# Runs on first request after server start - auto-generates missing PDFs on cloud deploy
-on_login = "wiki_pdf.tasks.ensure_pdf_caches_exist"
