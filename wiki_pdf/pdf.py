@@ -480,16 +480,16 @@ def _post_process_pdf(main_html, groups, lang_code="en"):
         gb = 'style="page-break-before:always;"' if g_idx > 0 else ""
         
         parts = [f'<div {gb}>']
-        # Invisible anchor
-        parts.append(f'<div style="color:#ffffff;font-size:1px;position:absolute;z-index:-1;">{g_id}</div>')
-        
+        # Anchor: inline, white text on white bg, 1pt — stays in PDF text layer for pypdf extraction
+        parts.append(f'<span style="color:#ffffff;font-size:1pt;line-height:0;">{g_id}</span>')
+
         if group["label"]:
             parts.append(f'<h1 class="group-name">{group["label"]}</h1>')
-            
+
         for p_idx, page in enumerate(group["pages"]):
             p_id = f"PTOC-{g_idx}-{p_idx}"
             page["anchor"] = p_id
-            p_div = f'<div style="color:#ffffff;font-size:1px;position:absolute;z-index:-1;">{p_id}</div>'
+            p_div = f'<span style="color:#ffffff;font-size:1pt;line-height:0;">{p_id}</span>'
             # If we already had a group label/header, we don't need another break for the first page
             pb = 'style="page-break-before:always;"' if (p_idx > 0 or (g_idx > 0 and not group["label"])) else ""
             tag = "h2" if group["label"] else "h1"
@@ -873,18 +873,6 @@ def download_wiki_pdf(page_name=None, route=None, lang="en"):
             frappe.local.response.type = "download"
             return
 
-        # Not cached — enqueue generation only if not already running.
-        # Use the same Redis lock as tasks.py to prevent duplicates.
-        redis_key = f"wiki_pdf_active_{lang_code}"
-        if not frappe.cache().get_value(redis_key):
-            frappe.enqueue(
-                "wiki_pdf.tasks.generate_pdf_for_single_language",
-                lang=lang_code,
-                queue="long",
-                timeout=7200,
-                job_name=f"wiki_pdf_generate_{lang_code}",
-            )
-            frappe.cache().set_value(redis_key, True, expires_in_sec=7200)
         frappe.throw(
             "The PDF for this language is being prepared in the background. "
             "Please try again in a few minutes."
