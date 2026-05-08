@@ -1,5 +1,33 @@
 import frappe
 import time
+import os
+import glob
+
+
+@frappe.whitelist()
+def clear_pdf_cache():
+    if "System Manager" not in frappe.get_roles(frappe.session.user):
+        frappe.throw("Not allowed")
+    pattern = os.path.join(frappe.get_site_path("public", "files"), "WikiPDF_DailyCache_*.pdf")
+    deleted = []
+    for f in glob.glob(pattern):
+        os.remove(f)
+        deleted.append(os.path.basename(f))
+    return deleted
+
+
+@frappe.whitelist()
+def trigger_pdf_generation():
+    if "System Manager" not in frappe.get_roles(frappe.session.user):
+        frappe.throw("Not allowed")
+    from wiki_pdf.pdf import get_normalized_lang
+    cleared = []
+    for lang in TARGET_LANGUAGES:
+        lang_code = get_normalized_lang(lang)
+        frappe.cache().delete_value(f"wiki_pdf_active_{lang_code}")
+        cleared.append(lang_code)
+    generate_daily_translated_pdfs()
+    return f"Cleared locks and enqueued jobs for: {cleared}"
 
 TARGET_LANGUAGES = [
     "en", "kn", "ta", "hi", "te", "mr", "bn", "gu", "ml", "ur", "pa",

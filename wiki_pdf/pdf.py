@@ -865,11 +865,6 @@ def _wrap(body):
 @frappe.whitelist(allow_guest=True)
 def download_wiki_pdf(page_name=None, route=None, lang="en"):
     try:
-        target_name = page_name or _find_page(route)
-        if not target_name:
-            frappe.throw(f"Wiki Page not found: {route or page_name}")
-
-        # Check disk cache — read directly from public/files to avoid File doctype renaming issues
         lang_code = get_normalized_lang(lang)
         pdf_bin = _load_pdf_from_cache(f"WikiPDF_DailyCache_{lang_code}.pdf")
         if pdf_bin:
