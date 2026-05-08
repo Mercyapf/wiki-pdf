@@ -21,6 +21,7 @@ def trigger_pdf_generation():
     if "System Manager" not in frappe.get_roles(frappe.session.user):
         frappe.throw("Not allowed")
     from wiki_pdf.pdf import get_normalized_lang
+    frappe.cache().delete_value("wiki_pdf_regen_pending")
     cleared = []
     for lang in TARGET_LANGUAGES:
         lang_code = get_normalized_lang(lang)
@@ -51,7 +52,6 @@ def _enqueue_language(lang, lang_code):
         queue="long",
         timeout=7200,
         job_name=f"wiki_pdf_generate_{lang_code}",
-        enqueue_after_commit=True,
     )
     frappe.cache().set_value(redis_key, True, expires_in_sec=7200)
     return True
