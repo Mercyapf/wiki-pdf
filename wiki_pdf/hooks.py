@@ -9,14 +9,11 @@ app_license = "MIT"
 
 web_include_js = "/assets/wiki_pdf/js/wiki_pdf.js"
 
-scheduler_events = {
-    "daily": [
-        "wiki_pdf.tasks.generate_daily_translated_pdfs"
-    ]
-}
-
 doc_events = {
     "Wiki Page": {
+        "after_save": "wiki_pdf.tasks.on_wiki_page_save"
+    },
+    "Wiki Space": {
         "after_save": "wiki_pdf.tasks.on_wiki_page_save"
     }
 }
