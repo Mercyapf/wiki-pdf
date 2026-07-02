@@ -572,15 +572,19 @@ def _post_process_pdf(main_html, groups, lang_code="en"):
         return b""
     
     # 3. Index pages
+    # Note: 1pt font causes wkhtmltopdf to position characters individually,
+    # so pypdf may insert spaces/newlines inside anchor text (e.g. "GTOC -0", "PTOC\n-0-0").
+    # The flexible regex allows optional whitespace between components; we then strip it.
     reader = PdfReader(io.BytesIO(content_pdf))
     page_map = {}
     for i, page in enumerate(reader.pages):
-        text = page.extract_text()
-        matches = re.findall(r'[GP]TOC-\d+(?:-\d+)?', text)
+        text = page.extract_text() or ""
+        matches = re.findall(r'[GP]TOC[\s]*-[\s]*\d+(?:[\s]*-[\s]*\d+)?', text)
         for m in matches:
-            if m not in page_map:
-                page_map[m] = i + 1 
-    
+            key = re.sub(r'\s+', '', m)  # normalize: "GTOC -0" → "GTOC-0"
+            if key not in page_map:
+                page_map[key] = i + 1
+
     if not page_map:
         frappe.log_error("PDF manual indexing failed: No anchors found in content PDF")
                 
@@ -710,8 +714,10 @@ def _save_pdf_to_cache(cache_fname, pdf_bin):
     pdf_bin = _compress_pdf_gs(pdf_bin, label=cache_fname)
 
     file_path = os.path.join(frappe.get_site_path("public", "files"), cache_fname)
-    with open(file_path, "wb") as f:
+    tmp_path = file_path + ".tmp"
+    with open(tmp_path, "wb") as f:
         f.write(pdf_bin)
+    os.replace(tmp_path, file_path)
 
     # Compression can take several minutes; ping DB before using it to avoid
     # "MySQL server has gone away" if the connection dropped during that time.
@@ -863,6 +869,27 @@ def _wrap(body):
 # frappe.throw(f"Error: {str(e)}")
 
 @frappe.whitelist(allow_guest=True)
+def check_wiki_pdf_status(lang="en"):
+    """Lightweight check — returns {ready, url} without streaming the file through Python."""
+    import os
+    lang_code = get_normalized_lang(lang)
+    cache_fname = f"WikiPDF_DailyCache_{lang_code}.pdf"
+    file_path = os.path.join(frappe.get_site_path("public", "files"), cache_fname)
+
+    if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
+        return {"ready": True, "url": f"/files/{cache_fname}"}
+
+    # Not ready — trigger background generation for this language
+    try:
+        from wiki_pdf.tasks import _enqueue_language
+        _enqueue_language(lang, lang_code)
+    except Exception:
+        pass
+
+    return {"ready": False, "url": None}
+
+
+@frappe.whitelist(allow_guest=True)
 def download_wiki_pdf(page_name=None, route=None, lang="en"):
     try:
         lang_code = get_normalized_lang(lang)
@@ -872,6 +899,13 @@ def download_wiki_pdf(page_name=None, route=None, lang="en"):
             frappe.local.response.filecontent = pdf_bin
             frappe.local.response.type = "download"
             return
+
+        # PDF not cached — trigger generation for this language and tell user to wait
+        try:
+            from wiki_pdf.tasks import _enqueue_language
+            _enqueue_language(lang, lang_code)
+        except Exception:
+            pass
 
         frappe.throw(
             "The PDF for this language is being prepared in the background. "
