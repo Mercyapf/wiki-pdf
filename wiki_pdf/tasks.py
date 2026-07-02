@@ -114,9 +114,10 @@ def generate_pdf_for_single_language(lang):
             p = p_map[s.wiki_page]
             label = s.parent_label or ""
 
-            if not groups or groups[-1]["label"] != label:
+            if not groups or groups[-1]["raw_label"] != label:
                 translated_label = _safe_translate(label, lang_code) if label else label
                 groups.append({
+                    "raw_label": label,
                     "label": translated_label,
                     "number": group_counter,
                     "anchor": f"GTOC-{group_counter}",
